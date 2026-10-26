@@ -1457,7 +1457,16 @@ mod tests {
             .as_nanos();
         let output = std::env::temp_dir().join(format!("assfonts-progress-{unique}"));
         let mut options = base_options(output.clone());
-        options.fontpaths = Some(vec![PathBuf::from("C:/Windows/Fonts")]);
+        // Use the platform's standard system font directory so the test does
+        // not depend on `C:/Windows/Fonts` (which only exists on Windows).
+        let system_fonts = if cfg!(windows) {
+            PathBuf::from("C:/Windows/Fonts")
+        } else if cfg!(target_os = "macos") {
+            PathBuf::from("/System/Library/Fonts")
+        } else {
+            PathBuf::from("/usr/share/fonts")
+        };
+        options.fontpaths = Some(vec![system_fonts]);
 
         let reporter = RecordingReporter {
             messages: Mutex::new(Vec::new()),
