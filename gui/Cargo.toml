@@ -1,0 +1,16 @@
+[package]
+name = "assfonts-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+assfonts = { path = ".." }
+gpui-kit = "0.8"
+smol = "2"
+walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# gpui-kit-assets embeds icons via rust-embed; debug builds read from the
+# filesystem at runtime unless the debug-embed feature is enabled. Declaring
+# the dep here turns the feature on for the shared rust-embed instance.
+rust-embed = { version = "8", features = ["debug-embed"] }

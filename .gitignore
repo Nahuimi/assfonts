@@ -1,3 +1,28 @@
 /target
 out*/
 *.txt
+
+# Build artifacts
+*.exe
+*.dll
+
+# User config (portable, next to exe)
+gui.toml
+
+# Font database
+fonts.db
+*.db
+
+# Mux temp directories
+*.fonts/
+
+# Local reference & smoke test
+tmp/
+
+# Security scan cache
+.mimosa/
+
+# Project docs (local development notes)
+docs/
+history/
+PROJECT_INDEX.md

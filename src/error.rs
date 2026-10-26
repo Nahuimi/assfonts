@@ -43,6 +43,15 @@ pub enum AssfontsError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    #[error("mux error: {0}")]
+    Mux(String),
+
+    #[error("external tool not found: {0}")]
+    MissingExternalTool(String),
+
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("other error: {0}")]
     Other(#[from] eyre::Report),
 }

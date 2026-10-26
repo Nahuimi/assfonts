@@ -1,26 +1,16 @@
-mod ass;
-mod cff_fix;
-mod cli;
-mod commands;
-mod db;
-mod embed;
-mod error;
-mod font;
-mod subset;
-
 use clap::Parser;
 
-use crate::{
+use assfonts::{
     cli::{Cli, Commands},
-    commands::{run_build, run_process},
+    commands::{SilentReporter, run_build, run_process},
 };
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
     match cli.command {
-        Some(Commands::Build(options)) => run_build(options),
-        None => run_process(cli.run),
+        Some(Commands::Build(options)) => run_build(options, &SilentReporter),
+        None => run_process(cli.run, &SilentReporter),
     }
     .map_err(|err| err.into_report())
 }

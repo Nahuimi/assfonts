@@ -54,7 +54,7 @@ assfonts -i /path/to/ass/files -o output_dir -f /path/to/fonts -d /path/to/db
 ```
 
 Options:
-- `-i, --input`: Input ASS files or directories (required, supports multiple paths)
+- `-i, --input`: Input ASS/SSA files or directories (required, supports multiple paths)
 - `-o, --output`: Output directory (default: current directory)
 - `-f, --fontpath`: Font directories to scan (optional)
 - `-d, --dbpath`: Directory containing `fonts.db` (default: current directory)
@@ -63,6 +63,18 @@ Options:
 - `--allow-missing-fonts`: Allow missing fonts
 - `--report`: Generate `run-report.json` after processing
 - `--force`: Overwrite existing output files
+- `--format embed|mks|mkv`: Output format (default: `embed`). `mks` muxes each subtitle with its subsetted fonts into a standalone Matroska file; `mkv` muxes media + subtitles + fonts.
+- `--video <path>...`: Media files or directories for `--format mkv` (paired with subtitles by file name)
+- `--muxer mkvmerge|ffmpeg`: External muxer used by mks/mkv (default: `mkvmerge`)
+- `--language <spec>`: Subtitle language, e.g. `chi` (all tracks) or `.sc=chi;.tc=chi` comment mappings (built-in defaults for `.sc/.tc/.chs/.cht/...` apply first)
+- `--default-track <comment>`: Subtitle filename comment (part after the media name) to mark as default
+- `--title <title>`: Override the container title (default: media file name)
+- `--keep-subs` / `--keep-attachments`: Keep original subtitle tracks/attachments of the input media
+- `--use-embedded-fonts <BOOL>`: Use fonts embedded in the input `[Fonts]` section as the highest-priority font source, so re-processing an embedded ASS needs no installed fonts (default: true)
+- `--rename-fonts <BOOL>`: Rename subsetted fonts with a CRC suffix and rewrite ASS references to avoid same-family face ambiguity (default: true)
+- `--utf8-sig`: Write output ASS files with a UTF-8 BOM
+- `--char-compatible`: Keep all ASCII letters (and all digits when any digit is used) in subsetted fonts for renderer compatibility
+- `--keep-temp`: Keep the intermediate subsetted font files after muxing (removed on success by default)
 
 ## Examples
 
@@ -98,6 +110,25 @@ Allow missing fonts and continue processing:
 ```bash
 assfonts -i video.ass -o ./out -f C:/Windows/Fonts --allow-missing-fonts --allow-missing-sample
 ```
+
+### Mux Into MKV
+
+Mux a video with subtitle(s) and subsetted fonts as attachments (requires `mkvmerge`):
+
+```bash
+# Subtitles named show.sc.ass / show.tc.ass pair with show.mkv by name;
+# languages come from the built-in comment map (.sc/.tc/.chs/.cht -> chi)
+assfonts -i show.sc.ass -i show.tc.ass -o ./out -f C:/Windows/Fonts --format mkv --video show.mkv
+
+# Standalone subtitle-only Matroska file
+assfonts -i show.sc.ass -o ./out -f C:/Windows/Fonts --format mks
+```
+
+## Documentation
+
+- [Project index](PROJECT_INDEX.md) — task-to-document routing
+- [Porting plan: MKS/MKV muxing + gpui-kit GUI](docs/context/PLAN.md) — active development plan
+- [Current status](docs/context/NOW.md)
 
 ## Related Projects
 

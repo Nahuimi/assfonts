@@ -54,7 +54,7 @@ assfonts -i /path/to/ass/files -o output_dir -f /path/to/fonts -d /path/to/db
 ```
 
 参数：
-- `-i, --input`：输入 ASS 文件或目录（必需，支持多个路径）
+- `-i, --input`：输入 ASS/SSA 文件或目录（必需，支持多个路径）
 - `-o, --output`：输出目录（默认：当前目录）
 - `-f, --fontpath`：要扫描的字体目录（可选）
 - `-d, --dbpath`：包含 `fonts.db` 的目录（默认：当前目录）
@@ -63,6 +63,18 @@ assfonts -i /path/to/ass/files -o output_dir -f /path/to/fonts -d /path/to/db
 - `--allow-missing-fonts`：允许缺失字体
 - `--report`：处理后生成 `run-report.json` 报告
 - `--force`：覆盖已存在的输出文件
+- `--format embed|mks|mkv`：输出格式（默认 `embed`）。`mks` 将每条字幕与其子集化字体封装为独立 Matroska 文件；`mkv` 将视频 + 字幕 + 字体封装为 MKV
+- `--video <path>...`：`--format mkv` 的媒体文件或目录（按文件名与字幕配对）
+- `--muxer mkvmerge|ffmpeg`：mks/mkv 使用的封装器（默认 `mkvmerge`）
+- `--language <spec>`：字幕语言，如 `chi`（全部轨道）或 `.sc=chi;.tc=chi` 注释映射（内置 `.sc/.tc/.chs/.cht/...` 映射优先生效）
+- `--default-track <comment>`：指定为默认轨的字幕注释（文件名中媒体名之后的部分）
+- `--title <title>`：覆盖容器标题（默认为媒体文件名）
+- `--keep-subs` / `--keep-attachments`：保留输入媒体中原有的字幕轨/附件
+- `--use-embedded-fonts <BOOL>`：把输入字幕 `[Fonts]` 段内嵌的字体作为最高优先级字体源，二次处理已内嵌字幕无需系统安装字体（默认 true）
+- `--rename-fonts <BOOL>`：用 CRC 后缀重命名子集字体并同步改写 ASS 引用，避免同族多字面匹配歧义（默认 true）
+- `--utf8-sig`：输出的 ASS 文件带 UTF-8 BOM
+- `--char-compatible`：子集字体恒保留 a-z/A-Z，出现任意数字时保留全部 0-9（兼容部分渲染器）
+- `--keep-temp`：封装后保留中间子集字体文件（默认成功后删除）
 
 ## 示例
 
@@ -98,6 +110,25 @@ assfonts -i video.ass -o ./out -f C:/Windows/Fonts --report
 ```bash
 assfonts -i video.ass -o ./out -f C:/Windows/Fonts --allow-missing-fonts --allow-missing-sample
 ```
+
+### 封装为 MKV
+
+将视频、字幕与子集化字体（作为附件）封装到 MKV（需要 `mkvmerge`）：
+
+```bash
+# 字幕 show.sc.ass / show.tc.ass 按文件名与 show.mkv 配对；
+# 语言取自内置注释映射（.sc/.tc/.chs/.cht -> chi）
+assfonts -i show.sc.ass -i show.tc.ass -o ./out -f C:/Windows/Fonts --format mkv --video show.mkv
+
+# 仅字幕 + 字体的独立 Matroska 文件
+assfonts -i show.sc.ass -o ./out -f C:/Windows/Fonts --format mks
+```
+
+## 文档
+
+- [项目索引](PROJECT_INDEX.md) — 任务到文档的路由
+- [移植计划：MKS/MKV 封装 + gpui-kit GUI](docs/context/PLAN.md) — 进行中的开发计划
+- [当前状态](docs/context/NOW.md)
 
 ## 相关项目
 
