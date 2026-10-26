@@ -88,6 +88,7 @@ pub struct SilentReporter;
 
 impl ProgressReporter for SilentReporter {
     fn report(&self, _message: String) {}
+
     fn cancelled(&self) -> bool {
         false
     }
@@ -368,10 +369,7 @@ fn process_single_input(
     })
 }
 
-fn collect_input_files(
-    inputs: &[PathBuf],
-    extensions: &[&str],
-) -> Result<Vec<(PathBuf, PathBuf)>> {
+fn collect_input_files(inputs: &[PathBuf], extensions: &[&str]) -> Result<Vec<(PathBuf, PathBuf)>> {
     let matches = |path: &std::path::Path| -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
@@ -662,7 +660,11 @@ fn mux_group(
                             font_outputs.get(&make_resolved_key(record))
                     {
                         renames.insert(
-                            RenameKey::new(request.font_name.as_str(), request.bold, request.italic),
+                            RenameKey::new(
+                                request.font_name.as_str(),
+                                request.bold,
+                                request.italic,
+                            ),
                             new_name.clone(),
                         );
                         subset_records.push((new_name.clone(), request.font_name.clone()));
@@ -1345,7 +1347,10 @@ mod tests {
     #[test]
     fn decodes_utf8_with_and_without_bom() {
         let plain = b"[Script Info]\nTitle: demo";
-        assert_eq!(decode_ass_bytes(plain).unwrap(), "[Script Info]\nTitle: demo");
+        assert_eq!(
+            decode_ass_bytes(plain).unwrap(),
+            "[Script Info]\nTitle: demo"
+        );
 
         let mut bom = vec![0xEF, 0xBB, 0xBF];
         bom.extend_from_slice(b"[Script Info]");
@@ -1356,9 +1361,7 @@ mod tests {
     #[test]
     fn decodes_gbk_fallback() {
         // "中文测试" in GBK
-        let gbk: &[u8] = &[
-            0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, 0x0A,
-        ];
+        let gbk: &[u8] = &[0xD6, 0xD0, 0xCE, 0xC4, 0xB2, 0xE2, 0xCA, 0xD4, 0x0A];
         let decoded = decode_ass_bytes(gbk).unwrap();
         assert_eq!(decoded.trim_end(), "中文测试");
     }
@@ -1383,6 +1386,7 @@ mod tests {
 
     impl super::ProgressReporter for CancelledReporter {
         fn report(&self, _message: String) {}
+
         fn cancelled(&self) -> bool {
             true
         }
@@ -1441,6 +1445,7 @@ mod tests {
             fn report(&self, message: String) {
                 self.messages.lock().unwrap().push(message);
             }
+
             fn cancelled(&self) -> bool {
                 false
             }

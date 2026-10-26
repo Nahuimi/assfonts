@@ -85,9 +85,9 @@ pub fn create_muxer_with(
         }
     };
     let resolve = |name: &str| -> Result<String> {
-        find_on_path(name).map(|path| path.to_string_lossy().into_owned()).ok_or_else(|| {
-            AssfontsError::MissingExternalTool(format!("{name} not found on PATH"))
-        })
+        find_on_path(name)
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| AssfontsError::MissingExternalTool(format!("{name} not found on PATH")))
     };
 
     match choice {

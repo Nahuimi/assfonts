@@ -9,23 +9,33 @@
 // The GUI ships as a windowed application; no console host is needed.
 #![windows_subsystem = "windows"]
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use assfonts::cli::{BuildOptions, MuxerChoice, OutputFormat, RunOptions};
-use assfonts::commands::ProgressReporter;
-use assfonts::mux;
-use gpui_kit::assets::{AllAssets, IconName};
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::switch::Switch;
-use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::component::{ActiveTheme, TitleBar, *};
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::*;
-
-use gpui_kit::ExternalPaths;
+use assfonts::{
+    cli::{BuildOptions, MuxerChoice, OutputFormat, RunOptions},
+    commands::ProgressReporter,
+    mux,
+};
+use gpui_kit::{
+    ExternalPaths,
+    assets::{AllAssets, IconName},
+    component::{
+        ActiveTheme, TitleBar,
+        button::{Button, ButtonVariants},
+        input::{Input, InputState},
+        switch::Switch,
+        theme::{Theme, ThemeMode},
+        *,
+    },
+    prelude::FluentBuilder as _,
+    *,
+};
 
 /// Persisted GUI state, stored as TOML under `<config_dir>/assfonts/gui.toml`.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -177,7 +187,10 @@ fn expand_paths(paths: Vec<PathBuf>, extensions: &[&str]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for path in paths {
         if path.is_dir() {
-            for entry in walkdir::WalkDir::new(&path).into_iter().filter_map(Result::ok) {
+            for entry in walkdir::WalkDir::new(&path)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
                 if entry.file_type().is_file()
                     && entry
                         .path()
@@ -236,9 +249,14 @@ impl AssfontsApp {
         let mut make_input = |placeholder: &'static str| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
-        let apply_input = |state: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut Context<AssfontsApp>| {
+        let apply_input = |state: &Entity<InputState>,
+                           value: &str,
+                           window: &mut Window,
+                           cx: &mut Context<AssfontsApp>| {
             if !value.is_empty() {
-                state.update(cx, |input, cx| input.replace_all(value.to_string(), window, cx));
+                state.update(cx, |input, cx| {
+                    input.replace_all(value.to_string(), window, cx)
+                });
             }
         };
 
@@ -249,7 +267,9 @@ impl AssfontsApp {
         let videos_input = make_input("媒体文件/目录（mkv 模式，按文件名与字幕配对）");
         let match_videos_input = make_input("视频文件/目录，多个用 ; 分隔");
         let match_subs_input = make_input("字幕文件/目录（ass/ssa），多个用 ; 分隔");
-        let suffix_rule_input = make_input("后缀规则：留空保留原后缀；sc.ass 统一后缀；chs|sc.Haruhana;cht|tc.Haruhana 按注释映射");
+        let suffix_rule_input = make_input(
+            "后缀规则：留空保留原后缀；sc.ass 统一后缀；chs|sc.Haruhana;cht|tc.Haruhana 按注释映射",
+        );
         let muxer_path_input = make_input("封装器可执行文件路径，留空用 PATH");
         let ffprobe_path_input = make_input("ffprobe 路径（仅 ffmpeg 需要），留空用 PATH");
 
@@ -626,8 +646,7 @@ impl AssfontsApp {
                     for entry in entries.filter_map(Result::ok) {
                         let entry_path = entry.path();
                         if entry_path.is_file()
-                            && let Some(file_name) =
-                                entry.file_name().to_str().map(str::to_string)
+                            && let Some(file_name) = entry.file_name().to_str().map(str::to_string)
                         {
                             let as_path = PathBuf::from(file_name);
                             if is_video(&as_path) {
@@ -762,15 +781,15 @@ impl AssfontsApp {
                     ),
             )
             .child(
-                Switch::new(id).checked(checked).on_click(
-                    move |checked: &bool, _, cx| {
+                Switch::new(id)
+                    .checked(checked)
+                    .on_click(move |checked: &bool, _, cx| {
                         entity.update(cx, |this, cx| {
                             setter(this, *checked);
                             this.persist(cx);
                             cx.notify();
                         });
-                    },
-                ),
+                    }),
             )
     }
 
@@ -828,46 +847,45 @@ impl AssfontsApp {
                 .into_any_element()
         };
 
-        let nav_item = |id: &'static str,
-                        icon: IconName,
-                        label: &'static str,
-                        page: Page|
-         -> AnyElement {
-            let nav_entity = entity.clone();
-            let active = self.page == page;
-            let row = h_flex()
-                .id(id)
-                .h(px(32.))
-                .w_full()
-                .flex_shrink_0()
-                .items_center()
-                .rounded(px(6.))
-                .text_color(if active {
-                    sidebar_accent_fg
-                } else {
-                    sidebar_fg
-                })
-                .when(active, |this| this.bg(sidebar_accent))
-                .when(!active, |this| {
-                    this.hover(|style| style.bg(sidebar_accent.opacity(0.8)))
-                })
-                .on_click(move |_, _, cx| {
-                    nav_entity.update(cx, |this, cx| {
-                        this.page = page;
-                        cx.notify();
+        let nav_item =
+            |id: &'static str, icon: IconName, label: &'static str, page: Page| -> AnyElement {
+                let nav_entity = entity.clone();
+                let active = self.page == page;
+                let row = h_flex()
+                    .id(id)
+                    .h(px(32.))
+                    .w_full()
+                    .flex_shrink_0()
+                    .items_center()
+                    .rounded(px(6.))
+                    .text_color(if active {
+                        sidebar_accent_fg
+                    } else {
+                        sidebar_fg
+                    })
+                    .when(active, |this| this.bg(sidebar_accent))
+                    .when(!active, |this| {
+                        this.hover(|style| style.bg(sidebar_accent.opacity(0.8)))
+                    })
+                    .on_click(move |_, _, cx| {
+                        nav_entity.update(cx, |this, cx| {
+                            this.page = page;
+                            cx.notify();
+                        });
                     });
-                });
 
-            if collapsed {
-                row.justify_center().child(Icon::new(icon)).into_any_element()
-            } else {
-                row.gap_2()
-                    .px_2()
-                    .child(Icon::new(icon))
-                    .child(div().text_size(px(13.)).child(label))
-                    .into_any_element()
-            }
-        };
+                if collapsed {
+                    row.justify_center()
+                        .child(Icon::new(icon))
+                        .into_any_element()
+                } else {
+                    row.gap_2()
+                        .px_2()
+                        .child(Icon::new(icon))
+                        .child(div().text_size(px(13.)).child(label))
+                        .into_any_element()
+                }
+            };
 
         v_flex()
             .flex_shrink_0()
@@ -881,17 +899,20 @@ impl AssfontsApp {
             .px_2()
             .gap_1()
             .child(header)
-            .child(nav_item("nav-process", IconName::Film, "处理", Page::Process))
+            .child(nav_item(
+                "nav-process",
+                IconName::Film,
+                "处理",
+                Page::Process,
+            ))
             .child(nav_item("nav-fonts", IconName::Type, "字体", Page::Fonts))
             .child(nav_item("nav-match", IconName::Link, "匹配", Page::Match))
-            .child(
-                nav_item(
-                    "nav-settings",
-                    IconName::SlidersHorizontal,
-                    "设置",
-                    Page::Settings,
-                ),
-            )
+            .child(nav_item(
+                "nav-settings",
+                IconName::SlidersHorizontal,
+                "设置",
+                Page::Settings,
+            ))
             .child(div().flex_1())
             .child(self.render_theme_footer(cx))
     }
@@ -916,7 +937,11 @@ impl AssfontsApp {
             });
 
         if collapsed {
-            h_flex().h(px(32.)).items_center().justify_center().child(button)
+            h_flex()
+                .h(px(32.))
+                .items_center()
+                .justify_center()
+                .child(button)
         } else {
             h_flex()
                 .h(px(32.))
@@ -981,16 +1006,11 @@ impl AssfontsApp {
             h_flex()
                 .gap_1()
                 .items_center()
-                .child(
-                    div()
-                        .size(px(7.))
-                        .rounded_full()
-                        .bg(if found {
-                            gpui_kit::hsla(0.33, 0.7, 0.45, 1.0)
-                        } else {
-                            muted_foreground(cx)
-                        }),
-                )
+                .child(div().size(px(7.)).rounded_full().bg(if found {
+                    gpui_kit::hsla(0.33, 0.7, 0.45, 1.0)
+                } else {
+                    muted_foreground(cx)
+                }))
                 .child(
                     div()
                         .text_size(px(11.5))
@@ -1024,7 +1044,9 @@ impl AssfontsApp {
                         div()
                             .text_size(px(12.5))
                             .text_color(muted_foreground(cx))
-                            .child("字幕字体子集化、内嵌或封装为 mks/mkv（输入框支持拖入，可多选）"),
+                            .child(
+                                "字幕字体子集化、内嵌或封装为 mks/mkv（输入框支持拖入，可多选）",
+                            ),
                     ),
             )
             .child(Self::card(
@@ -1046,22 +1068,18 @@ impl AssfontsApp {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(
-                                div().flex_1().child(drop_input(
-                                    &entity,
-                                    &self.dbpath_input,
-                                    DropMode::Replace,
-                                    Input::new(&self.dbpath_input).into_any_element(),
-                                )),
-                            )
-                            .child(
-                                div().flex_1().child(drop_input(
-                                    &entity,
-                                    &self.output_input,
-                                    DropMode::Replace,
-                                    Input::new(&self.output_input).into_any_element(),
-                                )),
-                            ),
+                            .child(div().flex_1().child(drop_input(
+                                &entity,
+                                &self.dbpath_input,
+                                DropMode::Replace,
+                                Input::new(&self.dbpath_input).into_any_element(),
+                            )))
+                            .child(div().flex_1().child(drop_input(
+                                &entity,
+                                &self.output_input,
+                                DropMode::Replace,
+                                Input::new(&self.output_input).into_any_element(),
+                            ))),
                     )
                     .child(drop_input(
                         &entity,
@@ -1087,57 +1105,51 @@ impl AssfontsApp {
             // 操作栏固定在最下方：格式/封装器/运行。
             .child(Self::card(
                 cx,
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().text_size(px(13.)).child("格式"))
-                            .child(
-                                Button::new("format").label(format_label).on_click(
-                                    move |_, _, cx| {
-                                        format_entity.update(cx, |this, cx| {
-                                            this.format_index = (this.format_index + 1) % FORMATS.len();
-                                            this.persist(cx);
-                                            cx.notify();
-                                        });
-                                    },
-                                ),
-                            )
-                            .child(div().text_size(px(13.)).child("封装器"))
-                            .child(
-                                Button::new("muxer").label(muxer_label).on_click(
-                                    move |_, _, cx| {
-                                        muxer_entity.update(cx, |this, cx| {
-                                            this.muxer_index = (this.muxer_index + 1) % MUXERS.len();
-                                            this.persist(cx);
-                                            cx.notify();
-                                        });
-                                    },
-                                ),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                Button::new("run")
-                                    .primary()
-                                    .label(if running { "处理中…" } else { "运行" })
-                                    .on_click(move |_, _, cx| {
-                                        run_process_clicked(&run_entity, cx);
-                                    }),
-                            )
-                            .when(running, |this| {
-                                this.child(
-                                    Button::new("cancel").label("取消").on_click(
-                                        move |_, _, cx| {
-                                            cancel_entity.update(cx, |this, cx| {
-                                                this.request_cancel(cx);
-                                            });
-                                        },
-                                    ),
-                                )
-                            }),
-                    ),
+                v_flex().gap_1().child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_size(px(13.)).child("格式"))
+                        .child(Button::new("format").label(format_label).on_click(
+                            move |_, _, cx| {
+                                format_entity.update(cx, |this, cx| {
+                                    this.format_index = (this.format_index + 1) % FORMATS.len();
+                                    this.persist(cx);
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .child(div().text_size(px(13.)).child("封装器"))
+                        .child(
+                            Button::new("muxer")
+                                .label(muxer_label)
+                                .on_click(move |_, _, cx| {
+                                    muxer_entity.update(cx, |this, cx| {
+                                        this.muxer_index = (this.muxer_index + 1) % MUXERS.len();
+                                        this.persist(cx);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("run")
+                                .primary()
+                                .label(if running { "处理中…" } else { "运行" })
+                                .on_click(move |_, _, cx| {
+                                    run_process_clicked(&run_entity, cx);
+                                }),
+                        )
+                        .when(running, |this| {
+                            this.child(Button::new("cancel").label("取消").on_click(
+                                move |_, _, cx| {
+                                    cancel_entity.update(cx, |this, cx| {
+                                        this.request_cancel(cx);
+                                    });
+                                },
+                            ))
+                        }),
+                ),
             ))
     }
 
@@ -1605,12 +1617,11 @@ fn run_build_clicked(entity: &Entity<AssfontsApp>, cx: &mut App) {
             PathBuf::from(dbpath_value.trim())
         };
         let options = BuildOptions { fontpaths, output };
-        if let Some(message) = this.spawn_task(
-            weak,
-            cx,
-            "重建字体索引".to_string(),
-            move |reporter| assfonts::commands::run_build(options, reporter),
-        ) {
+        if let Some(message) =
+            this.spawn_task(weak, cx, "重建字体索引".to_string(), move |reporter| {
+                assfonts::commands::run_build(options, reporter)
+            })
+        {
             this.push_log(message);
         }
         cx.notify();
@@ -1628,13 +1639,15 @@ impl Render for AssfontsApp {
 
         v_flex()
             .size_full()
-            .child(TitleBar::new().child(
-                div()
-                    .px_2()
-                    .text_size(px(12.5))
-                    .text_color(muted_foreground(cx))
-                    .child("assfonts"),
-            ))
+            .child(
+                TitleBar::new().child(
+                    div()
+                        .px_2()
+                        .text_size(px(12.5))
+                        .text_color(muted_foreground(cx))
+                        .child("assfonts"),
+                ),
+            )
             .child(
                 h_flex()
                     .flex_1()

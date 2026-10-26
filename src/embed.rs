@@ -4,7 +4,8 @@ pub struct EmbeddedFont {
     pub bytes: Vec<u8>,
 }
 
-pub fn uuencode(input: &[u8], insert_linebreaks: bool) -> String {    let size = input.len();
+pub fn uuencode(input: &[u8], insert_linebreaks: bool) -> String {
+    let size = input.len();
     let mut output = String::with_capacity((size * 4).div_ceil(3) + size / 80 * 2);
     let mut written = 0usize;
 
@@ -167,9 +168,7 @@ fn remove_existing_fonts_section(lines: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EmbeddedFont, extract_embedded_fonts, render_ass_with_fonts, uudecode, uuencode,
-    };
+    use super::{EmbeddedFont, extract_embedded_fonts, render_ass_with_fonts, uudecode, uuencode};
 
     #[test]
     fn uuencode_matches_known_result() {

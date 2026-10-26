@@ -58,7 +58,7 @@ jobs:
         run: cargo build --release --bin assfonts --target ${{ matrix.target }}
 
       - name: Build GUI
-        run: cargo build --release --bin assfonts-gui --target ${{ matrix.target }}
+        run: cargo build --release -p assfonts-gui --bin assfonts-gui --target ${{ matrix.target }}
 
       - name: Run tests
         run: cargo test

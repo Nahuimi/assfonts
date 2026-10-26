@@ -1,8 +1,7 @@
 use std::{path::Path, process::Command};
 
+use super::{MuxResult, job::MuxJob};
 use crate::error::{AssfontsError, Result};
-
-use super::{job::MuxJob, MuxResult};
 
 pub struct FfmpegMuxer {
     pub program: String,
@@ -172,9 +171,10 @@ impl super::Muxer for FfmpegMuxer {
     fn mux(&self, job: &MuxJob, _scratch_dir: &Path) -> Result<MuxResult> {
         let probe = match &job.media {
             Some(media) => {
-                let ffprobe = self.ffprobe.as_deref().ok_or_else(|| {
-                    AssfontsError::MissingExternalTool("ffprobe".to_string())
-                })?;
+                let ffprobe = self
+                    .ffprobe
+                    .as_deref()
+                    .ok_or_else(|| AssfontsError::MissingExternalTool("ffprobe".to_string()))?;
                 Some(probe_media(ffprobe, media)?)
             }
             None => None,
@@ -209,9 +209,10 @@ impl super::Muxer for FfmpegMuxer {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_args, ProbeInfo};
-    use crate::mux::{MuxJob, SubTrack};
     use std::path::PathBuf;
+
+    use super::{ProbeInfo, build_args};
+    use crate::mux::{MuxJob, SubTrack};
 
     #[test]
     fn builds_args_for_mkv_job() {

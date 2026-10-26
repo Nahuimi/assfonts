@@ -5,8 +5,7 @@
 //! ASS styles plus `\fn` override tags are rewritten to reference that name.
 //! Controlled by `--rename-fonts` in mks/mkv mode.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock};
 
 use crate::{
     error::{AssfontsError, Result},
@@ -131,7 +130,8 @@ pub fn rename_font_names(font_bytes: &[u8], new_name: &str) -> Result<Vec<u8>> {
         tables.push((tag, offset, length));
     }
 
-    let Some(&(_, name_offset, name_length)) = tables.iter().find(|(tag, _, _)| *tag == NAME_TABLE_TAG)
+    let Some(&(_, name_offset, name_length)) =
+        tables.iter().find(|(tag, _, _)| *tag == NAME_TABLE_TAG)
     else {
         return Err(AssfontsError::Font("font has no name table".to_string()));
     };
@@ -243,7 +243,8 @@ fn rename_name_records(records: Vec<NameRecord>, new_name: &str) -> Vec<NameReco
 
 fn build_name_table(records: &[NameRecord]) -> Vec<u8> {
     let string_offset = 6 + records.len() * 12;
-    let mut out = Vec::with_capacity(string_offset + records.iter().map(|r| r.value.len()).sum::<usize>());
+    let mut out =
+        Vec::with_capacity(string_offset + records.iter().map(|r| r.value.len()).sum::<usize>());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&(records.len() as u16).to_be_bytes());
     out.extend_from_slice(&(string_offset as u16).to_be_bytes());
@@ -322,7 +323,10 @@ pub fn rename_ass_fonts(content: &str, renames: &HashMap<RenameKey, String>) -> 
             }
             if let Some(rest) = trimmed.strip_prefix("Dialogue:") {
                 let fields = event_fields.as_ref();
-                out_lines.push(format!("Dialogue:{}", rename_dialogue_line(rest, fields, &styles, renames)));
+                out_lines.push(format!(
+                    "Dialogue:{}",
+                    rename_dialogue_line(rest, fields, &styles, renames)
+                ));
                 continue;
             }
         }
@@ -758,7 +762,8 @@ mod tests {
                 .into_iter()
                 .collect();
         let renamed = rename_ass_fonts(source, &map);
-        let recorded = write_subset_records(&renamed, &[("AAAA1111".to_string(), "Arial".to_string())]);
+        let recorded =
+            write_subset_records(&renamed, &[("AAAA1111".to_string(), "Arial".to_string())]);
         assert!(recorded.contains("Style: Default,AAAA1111,"));
         assert!(recorded.contains("{\\fnAAAA1111}hi"));
 
@@ -774,10 +779,7 @@ mod tests {
         let records = vec![
             ("AAAA1111".to_string(), "Source Han Sans".to_string()),
             ("BBBB2222".to_string(), "Arial".to_string()),
-            (
-                "CCCC3333".to_string(),
-                "Weird-Name-With-Dashes".to_string(),
-            ),
+            ("CCCC3333".to_string(), "Weird-Name-With-Dashes".to_string()),
         ];
         let content = "[Script Info]\nTitle: demo\n[V4+ Styles]\n";
         let written = write_subset_records(content, &records);
@@ -800,10 +802,7 @@ mod tests {
         entries
             .iter()
             .map(|(name, bold, italic, new)| {
-                (
-                    RenameKey::new(name, *bold, *italic),
-                    new.to_string(),
-                )
+                (RenameKey::new(name, *bold, *italic), new.to_string())
             })
             .collect()
     }
@@ -818,7 +817,10 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 8);
-        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_lowercase()));
+        assert!(
+            a.chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_lowercase())
+        );
     }
 
     #[test]
@@ -888,7 +890,12 @@ mod tests {
         name.extend_from_slice(&1u16.to_be_bytes());
         name.extend_from_slice(&8u16.to_be_bytes());
         name.extend_from_slice(&0u16.to_be_bytes());
-        name.extend_from_slice(&"Test".encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>());
+        name.extend_from_slice(
+            &"Test"
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<u8>>(),
+        );
 
         let mut head = vec![0u8; 54];
         head[8..12].copy_from_slice(&0x1234_5678u32.to_be_bytes());

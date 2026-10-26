@@ -1,8 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
+use super::{MuxResult, job::MuxJob};
 use crate::error::{AssfontsError, Result};
-
-use super::{job::MuxJob, MuxResult};
 
 pub struct MkvmergeMuxer {
     pub program: String,
@@ -20,9 +19,7 @@ pub fn build_option_args(job: &MuxJob) -> Vec<String> {
         if !job.keep_attachments {
             args.push("-M".to_string());
         }
-        args.extend(
-            ["(", media.to_string_lossy().as_ref(), ")"].map(String::from),
-        );
+        args.extend(["(", media.to_string_lossy().as_ref(), ")"].map(String::from));
     }
 
     for track in &job.subtitles {
@@ -31,15 +28,10 @@ pub fn build_option_args(job: &MuxJob) -> Vec<String> {
             args.push(format!("0:{title}"));
         }
         args.push("--language".to_string());
-        args.push(format!(
-            "0:{}",
-            track.language.as_deref().unwrap_or("und")
-        ));
+        args.push(format!("0:{}", track.language.as_deref().unwrap_or("und")));
         args.push("--default-track-flag".to_string());
         args.push(format!("0:{}", if track.is_default { 1 } else { 0 }));
-        args.extend(
-            ["(", track.path.to_string_lossy().as_ref(), ")"].map(String::from),
-        );
+        args.extend(["(", track.path.to_string_lossy().as_ref(), ")"].map(String::from));
     }
 
     for attachment in &job.attachments {
@@ -70,10 +62,7 @@ fn combine_log(output: &std::process::Output) -> String {
 
 fn log_tail(log: &str) -> String {
     let tail: Vec<&str> = log.lines().rev().take(20).collect();
-    tail.into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
+    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
 impl super::Muxer for MkvmergeMuxer {
@@ -120,9 +109,10 @@ impl super::Muxer for MkvmergeMuxer {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::build_option_args;
     use crate::mux::{MuxJob, SubTrack};
-    use std::path::PathBuf;
 
     #[test]
     fn builds_args_for_mkv_job() {

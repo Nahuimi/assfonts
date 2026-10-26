@@ -1,9 +1,8 @@
-use clap::Parser;
-
 use assfonts::{
     cli::{Cli, Commands},
     commands::{SilentReporter, run_build, run_process},
 };
+use clap::Parser;
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;

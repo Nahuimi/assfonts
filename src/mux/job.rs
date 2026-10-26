@@ -196,9 +196,7 @@ pub fn parse_language_spec(spec: &str) -> LanguageSpec {
 }
 
 fn normalize_language_key(key: &str) -> String {
-    key.trim()
-        .trim_start_matches('.')
-        .to_lowercase()
+    key.trim().trim_start_matches('.').to_lowercase()
 }
 
 /// Resolve the language for one track comment.
@@ -371,8 +369,8 @@ pub fn rename_proposals(
             let Some(ext) = sub.extension().and_then(|ext| ext.to_str()) else {
                 continue;
             };
-            let comment = subtitle_comment(sub_stem, video_stem)
-                .or_else(|| standalone_comment(sub_stem));
+            let comment =
+                subtitle_comment(sub_stem, video_stem).or_else(|| standalone_comment(sub_stem));
             let new_stem = match suffix_rule.suffix_for(comment.as_deref()) {
                 Some(suffix) => format!("{video_stem}.{suffix}"),
                 None => match comment {
@@ -396,13 +394,16 @@ pub fn rename_proposals(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        language_for_comment, match_media_groups, matches_media_prefix, parse_language_spec,
-        resolve_output_path, standalone_comment, subtitle_comment, LanguageSpec,
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
     };
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        LanguageSpec, language_for_comment, match_media_groups, matches_media_prefix,
+        parse_language_spec, resolve_output_path, standalone_comment, subtitle_comment,
+    };
 
     #[test]
     fn subtitle_comment_extracts_and_strips_markers() {
@@ -479,10 +480,7 @@ mod tests {
         assert_eq!(resolved, dir.join("out#1.mks"));
 
         fs::write(&resolved, b"").unwrap();
-        assert_eq!(
-            resolve_output_path(target.clone()),
-            dir.join("out#2.mks")
-        );
+        assert_eq!(resolve_output_path(target.clone()), dir.join("out#2.mks"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -491,7 +489,10 @@ mod tests {
     fn language_spec_parses_fixed_and_mappings() {
         let fixed = parse_language_spec("chi");
         assert_eq!(fixed.fixed.as_deref(), Some("chi"));
-        assert_eq!(language_for_comment(Some("sc"), &fixed).as_deref(), Some("chi"));
+        assert_eq!(
+            language_for_comment(Some("sc"), &fixed).as_deref(),
+            Some("chi")
+        );
         assert_eq!(language_for_comment(None, &fixed).as_deref(), Some("chi"));
 
         let mapped = parse_language_spec(".sc = chi ; .tc = zho ");
@@ -508,9 +509,12 @@ mod tests {
 
     #[test]
     fn rename_proposals_align_names_and_skip_conflicts() {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
         use super::{SuffixRule, rename_proposals};
-        use std::fs;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         let unique = format!(
             "assfonts-rename-{}",
@@ -554,7 +558,10 @@ mod tests {
 
         assert_eq!(parse_suffix_rule(""), SuffixRule::Keep);
         assert_eq!(parse_suffix_rule("   "), SuffixRule::Keep);
-        assert_eq!(parse_suffix_rule("sc.ass"), SuffixRule::Fixed("sc.ass".into()));
+        assert_eq!(
+            parse_suffix_rule("sc.ass"),
+            SuffixRule::Fixed("sc.ass".into())
+        );
         // Dots normalized.
         assert_eq!(
             parse_suffix_rule(".sc..ass"),
@@ -586,7 +593,10 @@ mod tests {
     fn order_matching_pairs_by_sorted_position() {
         use super::{match_media_groups_by_order, rename_proposals, subtitle_base_name};
 
-        assert_eq!(subtitle_base_name("[Haruhana] Show 01"), "[Haruhana] Show 01");
+        assert_eq!(
+            subtitle_base_name("[Haruhana] Show 01"),
+            "[Haruhana] Show 01"
+        );
         assert_eq!(subtitle_base_name("Show 01.sc"), "Show 01");
         // Heuristic grouping key (SubRenamer semantics: first dot in the
         // trailing window) — same-series multi-language subs share one key.
@@ -628,10 +638,7 @@ mod tests {
         use super::match_media_groups_by_order;
 
         let videos = vec![PathBuf::from("v1.mkv")];
-        let subs = vec![
-            PathBuf::from("s1.ass"),
-            PathBuf::from("s2.ass"),
-        ];
+        let subs = vec![PathBuf::from("s1.ass"), PathBuf::from("s2.ass")];
         let (groups, unmatched) = match_media_groups_by_order(&videos, &subs);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, PathBuf::from("v1.mkv"));
