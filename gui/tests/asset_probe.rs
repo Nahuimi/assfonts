@@ -8,8 +8,10 @@ use gpui_kit::AssetSource;
 fn ui_icon_assets_load() {
     for path in [
         "icons/film.svg",
+        "icons/file-text.svg",
         "icons/type.svg",
         "icons/link.svg",
+        "icons/pencil-line.svg",
         "icons/sliders-horizontal.svg",
         "icons/sun.svg",
         "icons/moon.svg",

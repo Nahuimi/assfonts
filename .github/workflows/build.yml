@@ -1,10 +1,7 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  # 仅手动触发：避免每次 push / PR 都跑三平台完整构建（正式发布走 release.yml）
   workflow_dispatch:
 
 env:
@@ -33,7 +30,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -71,14 +68,14 @@ jobs:
           cp target/${{ matrix.target }}/release/assfonts-gui${{ matrix.ext }} artifacts/
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: assfonts-${{ matrix.name }}
           path: artifacts/assfonts${{ matrix.ext }}
           if-no-files-found: error
 
       - name: Upload GUI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: assfonts-gui-${{ matrix.name }}
           path: artifacts/assfonts-gui${{ matrix.ext }}

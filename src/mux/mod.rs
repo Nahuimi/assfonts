@@ -1,6 +1,7 @@
 pub mod ffmpeg;
 pub mod job;
 pub mod mkvmerge;
+pub mod scan;
 
 use std::path::Path;
 

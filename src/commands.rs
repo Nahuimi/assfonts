@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
     path::PathBuf,
@@ -62,6 +62,61 @@ struct GlyphCoverageReport {
     original_bytes: usize,
     subset_bytes: usize,
     error: Option<String>,
+}
+
+/// Per-face result of a font check (`commands::check_subtitles`).
+#[derive(Debug, Clone)]
+pub struct CheckFontReport {
+    pub display_name: String,
+    pub path: PathBuf,
+    pub face_index: u32,
+    /// Font requests that resolved to this face, e.g. `Arial (bold=700, italic=false)`.
+    pub requests: Vec<String>,
+    pub required_count: usize,
+    pub supported_count: usize,
+    /// Characters this face cannot render (sorted).
+    pub missing_chars: Vec<char>,
+}
+
+/// Aggregated result of [`check_subtitles`]: what each subtitle needs, which
+/// fonts are missing, and which matched fonts lack glyphs.
+#[derive(Debug, Default, Clone)]
+pub struct CheckSummary {
+    /// Number of `.ass`/`.ssa` files found in the inputs.
+    pub subtitle_count: usize,
+    /// Distinct font requests across all subtitles.
+    pub font_request_count: usize,
+    /// Distinct unresolved font requests, sorted.
+    pub missing_fonts: Vec<String>,
+    /// Per resolved font face, merged across all subtitles.
+    pub font_reports: Vec<CheckFontReport>,
+    /// Subtitle files or fonts that could not be read.
+    pub error_count: usize,
+}
+
+impl CheckSummary {
+    /// Total number of characters missing from matched fonts.
+    pub fn missing_glyph_total(&self) -> usize {
+        self.font_reports
+            .iter()
+            .map(|report| report.missing_chars.len())
+            .sum()
+    }
+
+    /// Number of matched fonts that are missing at least one glyph.
+    pub fn incomplete_font_count(&self) -> usize {
+        self.font_reports
+            .iter()
+            .filter(|report| !report.missing_chars.is_empty())
+            .count()
+    }
+}
+
+/// Merge target for one resolved font face while walking subtitles.
+struct CheckFontAggregate {
+    record: FontRecord,
+    requests: BTreeSet<String>,
+    required_chars: HashSet<char>,
 }
 
 struct FontProcessResult {
@@ -230,6 +285,251 @@ pub fn run_process(options: RunOptions, reporter: &dyn ProgressReporter) -> Resu
         OutputFormat::Embed => run_process_embed(options, reporter),
         OutputFormat::Mks | OutputFormat::Mkv => run_process_mux(options, reporter),
     }
+}
+
+/// Font-only validation run: reads the inputs, resolves every font request,
+/// and reports required fonts, unresolved fonts, and glyphs missing from the
+/// matched fonts — without writing any output file.
+///
+/// The per-subtitle report goes through `reporter`; the aggregate is returned
+/// for callers that need it (the GUI 「测试」 button only streams the report).
+pub fn check_subtitles(
+    inputs: &[PathBuf],
+    options: &RunOptions,
+    reporter: &dyn ProgressReporter,
+) -> Result<CheckSummary> {
+    let ass_files = collect_input_files(inputs, &["ass", "ssa"])?;
+    if ass_files.is_empty() {
+        reporter.report("没有可检查的 .ass/.ssa 字幕（字体检查只支持 ASS/SSA）。".to_string());
+        return Ok(CheckSummary::default());
+    }
+
+    reporter.report(format!("待检查 {} 个字幕文件", ass_files.len()));
+    let mut summary = CheckSummary {
+        subtitle_count: ass_files.len(),
+        ..Default::default()
+    };
+
+    // Pass 1: read and analyze every subtitle, collecting the font names the
+    // font source has to resolve before matching can start.
+    let mut loaded: Vec<(PathBuf, String)> = Vec::new();
+    let mut requested_names: HashSet<String> = HashSet::new();
+    let mut requests_all: BTreeSet<String> = BTreeSet::new();
+    for (input, _) in &ass_files {
+        if reporter.cancelled() {
+            bail!(AssfontsError::Cancelled);
+        }
+        match load_and_preprocess_ass(input) {
+            Ok(content) => {
+                for request in analyze_ass(&content).font_requests.keys() {
+                    requested_names.insert(request.font_name.clone());
+                    requests_all.insert(format_request(request));
+                }
+                loaded.push((input.clone(), content));
+            }
+            Err(err) => {
+                summary.error_count += 1;
+                reporter.report(format!("[错误] 读取 {} 失败：{err}", input.display()));
+            }
+        }
+    }
+    summary.font_request_count = requests_all.len();
+
+    let contents: Vec<String> = loaded.iter().map(|(_, content)| content.clone()).collect();
+    let (embedded_fonts, _embedded_guard) = collect_embedded_font_records(options, &contents)?;
+    // A check run stays useful without a configured font source: treat the
+    // source as empty so that every request shows up as missing.
+    let fonts = match load_fonts_for_run(options, &requested_names, embedded_fonts) {
+        Ok(fonts) => fonts,
+        Err(AssfontsError::MissingFontSource(_)) => {
+            reporter.report(
+                "未找到字体来源（字体目录 / fonts.db / 内嵌字体），所有字体按缺失处理。"
+                    .to_string(),
+            );
+            Vec::new()
+        }
+        Err(err) => return Err(err),
+    };
+
+    let font_bytes_cache: DashMap<PathBuf, Vec<u8>> = DashMap::new();
+    let mut missing_fonts: BTreeSet<String> = BTreeSet::new();
+    let mut aggregated: HashMap<ResolvedFontKey, CheckFontAggregate> = HashMap::new();
+    let total = loaded.len();
+
+    // Pass 2: per-subtitle report; coverage is measured against the real font
+    // bytes and merged per face for the final summary.
+    for (index, (input, content)) in loaded.iter().enumerate() {
+        if reporter.cancelled() {
+            bail!(AssfontsError::Cancelled);
+        }
+        reporter.report(format!(
+            "[{}/{}] 检查 {}",
+            index + 1,
+            total,
+            input.display()
+        ));
+
+        let analysis = analyze_ass(content);
+        if analysis.font_requests.is_empty() {
+            reporter.report("  未发现字体请求（不是 ASS/SSA 字幕或没有对白）。".to_string());
+            continue;
+        }
+
+        let requests: Vec<String> = analysis.font_requests.keys().map(format_request).collect();
+        reporter.report(format!(
+            "  需要字体（{}）：{}",
+            requests.len(),
+            requests.join("、")
+        ));
+
+        let mut grouped: Vec<(FontRecord, BTreeSet<String>, HashSet<char>)> = Vec::new();
+        let mut grouped_index: HashMap<ResolvedFontKey, usize> = HashMap::new();
+        let mut missing_here: Vec<String> = Vec::new();
+        for (request, required_chars) in &analysis.font_requests {
+            match match_best_font(&fonts, request) {
+                Some(record) => {
+                    let key = make_resolved_key(record);
+                    if let Some(&existing) = grouped_index.get(&key) {
+                        grouped[existing].1.insert(format_request(request));
+                        grouped[existing].2.extend(required_chars.iter().copied());
+                    } else {
+                        grouped_index.insert(key, grouped.len());
+                        grouped.push((
+                            record.clone(),
+                            BTreeSet::from([format_request(request)]),
+                            required_chars.clone(),
+                        ));
+                    }
+                }
+                None => missing_here.push(format_request(request)),
+            }
+        }
+
+        if !missing_here.is_empty() {
+            missing_fonts.extend(missing_here.iter().cloned());
+            reporter.report(format!(
+                "  ✗ 缺少字体（{}）：{}",
+                missing_here.len(),
+                missing_here.join("、")
+            ));
+        }
+
+        for (record, request_names, required_chars) in grouped {
+            let bytes = match get_or_load_font_bytes(&record.path, &font_bytes_cache) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    summary.error_count += 1;
+                    reporter.report(format!(
+                        "  [错误] 读取字体 {} 失败：{err}",
+                        record.path.display()
+                    ));
+                    continue;
+                }
+            };
+            let (required_count, _, mut missing_chars) =
+                measure_font_coverage(&bytes, record.face_index, Some(&required_chars), usize::MAX);
+            missing_chars.sort_unstable();
+            report_font_coverage(reporter, &record, required_count, &missing_chars);
+
+            let entry = aggregated
+                .entry(make_resolved_key(&record))
+                .or_insert_with(|| CheckFontAggregate {
+                    record: record.clone(),
+                    requests: BTreeSet::new(),
+                    required_chars: HashSet::new(),
+                });
+            entry.requests.extend(request_names);
+            entry.required_chars.extend(required_chars);
+        }
+    }
+
+    for aggregate in aggregated.into_values() {
+        let bytes = match get_or_load_font_bytes(&aggregate.record.path, &font_bytes_cache) {
+            Ok(bytes) => bytes,
+            // Already reported per subtitle above.
+            Err(_) => continue,
+        };
+        let (required_count, supported_count, mut missing_chars) = measure_font_coverage(
+            &bytes,
+            aggregate.record.face_index,
+            Some(&aggregate.required_chars),
+            usize::MAX,
+        );
+        missing_chars.sort_unstable();
+        summary.font_reports.push(CheckFontReport {
+            display_name: aggregate.record.display_name.clone(),
+            path: aggregate.record.path.clone(),
+            face_index: aggregate.record.face_index,
+            requests: aggregate.requests.into_iter().collect(),
+            required_count,
+            supported_count,
+            missing_chars,
+        });
+    }
+    summary.font_reports.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.face_index.cmp(&right.face_index))
+    });
+    summary.missing_fonts = missing_fonts.into_iter().collect();
+
+    reporter.report(format!(
+        "检查汇总：{} 个字幕；字体请求 {} 个；命中字体 {} 个；缺少字体 {} 个；缺字字体 {} 个（共 {} 字）。",
+        summary.subtitle_count,
+        summary.font_request_count,
+        summary.font_reports.len(),
+        summary.missing_fonts.len(),
+        summary.incomplete_font_count(),
+        summary.missing_glyph_total(),
+    ));
+    if summary.missing_fonts.is_empty() && summary.incomplete_font_count() == 0 {
+        reporter.report("字体与字形全部齐备。".to_string());
+    }
+    if summary.error_count > 0 {
+        reporter.report(format!(
+            "有 {} 项读取失败，详见上方日志。",
+            summary.error_count
+        ));
+    }
+
+    Ok(summary)
+}
+
+/// One `✓ 字体（路径#face）…` log line for a matched face.
+fn report_font_coverage(
+    reporter: &dyn ProgressReporter,
+    record: &FontRecord,
+    required_count: usize,
+    missing_chars: &[char],
+) {
+    let target = format!(
+        "{}（{}#{}）",
+        record.display_name,
+        record.path.display(),
+        record.face_index
+    );
+    if missing_chars.is_empty() {
+        reporter.report(format!("  ✓ {target}：{required_count} 字全部可用"));
+        return;
+    }
+
+    const LOG_CHAR_LIMIT: usize = 200;
+    let shown: Vec<String> = missing_chars
+        .iter()
+        .take(LOG_CHAR_LIMIT)
+        .map(|character| format!("{character:?}"))
+        .collect();
+    let more = if missing_chars.len() > LOG_CHAR_LIMIT {
+        format!("…（仅列前 {LOG_CHAR_LIMIT} 字）")
+    } else {
+        String::new()
+    };
+    reporter.report(format!(
+        "  ✓ {target}：缺 {} 字（共 {} 字）：{}{more}",
+        missing_chars.len(),
+        required_count,
+        shown.join(" ")
+    ));
 }
 
 fn run_process_embed(options: RunOptions, reporter: &dyn ProgressReporter) -> Result<()> {
@@ -621,6 +921,27 @@ fn mux_group(
         font_outputs.insert(make_resolved_key(&pending.record), (path, crc));
     }
 
+    // 轨道命名（字幕组/语言后缀）与默认字幕：GUI 从 `gui.toml` 注入，
+    // CLI 未注入时回落到内置表。
+    let track_categories: Vec<mux::job::SuffixCategory> = if options.track_categories.is_empty() {
+        mux::job::default_categories().to_vec()
+    } else {
+        options.track_categories.clone()
+    };
+    let track_groups: Vec<mux::job::FansubGroup> = if options.track_groups.is_empty() {
+        mux::job::default_fansub_groups()
+    } else {
+        options.track_groups.clone()
+    };
+    let track_meta_options = mux::job::TrackMetaOptions {
+        categories: &track_categories,
+        groups: &track_groups,
+        overrides: &options.track_overrides,
+        style: options.track_name_style,
+        fansub_enabled: options.track_fansub_suffix,
+        language_enabled: options.track_language_suffix,
+    };
+
     let mut tracks = Vec::with_capacity(subs.len());
     for (index, sub) in subs.iter().enumerate() {
         let sub_stem = sub
@@ -636,16 +957,33 @@ fn mux_group(
             Some(media_stem) => mux::job::subtitle_comment(&sub_stem, media_stem),
             None => mux::job::standalone_comment(&sub_stem),
         };
-        let language = mux::job::language_for_comment(comment.as_deref(), language_spec);
-        let is_default = match &options.default_track {
-            Some(wanted) => {
-                let wanted = wanted.trim().trim_start_matches('.').to_lowercase();
-                comment
-                    .as_deref()
-                    .map(|value| value.to_lowercase() == wanted)
-                    .unwrap_or(false)
+        let meta = mux::job::subtitle_track_meta(comment.as_deref(), &track_meta_options);
+        // 语言标记：显式 --language 优先；否则用分类推导（简体/简日/简英 →
+        // zh-Hans，繁体/繁日/繁英 → zh-Hant，日语 → jpn，英语 → eng），最后
+        // 回落到旧的注释映射。
+        let language = if language_spec.is_explicit() {
+            mux::job::language_for_comment(comment.as_deref(), language_spec)
+        } else {
+            meta.language
+                .or_else(|| mux::job::language_for_comment(comment.as_deref(), language_spec))
+        };
+        let is_default = if options.default_track_keys.is_empty() {
+            match &options.default_track {
+                Some(wanted) => {
+                    let wanted = wanted.trim().trim_start_matches('.').to_lowercase();
+                    comment
+                        .as_deref()
+                        .map(|value| value.to_lowercase() == wanted)
+                        .unwrap_or(false)
+                }
+                None => index == 0,
             }
-            None => index == 0,
+        } else {
+            let key = mux::job::naming_key(comment.as_deref(), &track_categories);
+            options
+                .default_track_keys
+                .iter()
+                .any(|wanted| wanted.eq_ignore_ascii_case(&key))
         };
 
         // With --rename-fonts, rewrite each subtitle's style names and \fn
@@ -694,7 +1032,7 @@ fn mux_group(
 
         tracks.push(mux::SubTrack {
             path: track_path,
-            title: comment,
+            title: meta.title.or(comment),
             language,
             is_default,
         });
@@ -956,7 +1294,11 @@ fn build_coverage_report(
 
     let coverage_face_index = record.face_index;
     let (required_count, supported_count, missing_sample) =
-        measure_font_coverage(&subset_bytes, coverage_face_index, Some(required_chars));
+        measure_font_coverage(&subset_bytes, coverage_face_index, Some(required_chars), 12);
+    let missing_sample: Vec<String> = missing_sample
+        .into_iter()
+        .map(|character| character.to_string())
+        .collect();
 
     if (options.strict && !options.allow_missing_sample) && !missing_sample.is_empty() {
         return Err(AssfontsError::Font(format!(
@@ -1061,7 +1403,8 @@ fn measure_font_coverage(
     bytes: &[u8],
     face_index: u32,
     required_chars: Option<&HashSet<char>>,
-) -> (usize, usize, Vec<String>) {
+    sample_limit: usize,
+) -> (usize, usize, Vec<char>) {
     let Some(required_chars) = required_chars else {
         return (0, 0, Vec::new());
     };
@@ -1078,8 +1421,8 @@ fn measure_font_coverage(
 
         if supported {
             supported_count += 1;
-        } else if missing_sample.len() < 12 {
-            missing_sample.push(character.to_string());
+        } else if missing_sample.len() < sample_limit {
+            missing_sample.push(*character);
         }
     }
 
@@ -1408,6 +1751,13 @@ mod tests {
             muxer: crate::cli::MuxerChoice::Mkvmerge,
             language: None,
             default_track: None,
+            track_name_style: crate::mux::job::TrackNameStyle::English,
+            track_fansub_suffix: true,
+            track_language_suffix: true,
+            track_categories: Vec::new(),
+            track_groups: Vec::new(),
+            track_overrides: std::collections::BTreeMap::new(),
+            default_track_keys: Vec::new(),
             title: None,
             keep_subs: false,
             keep_attachments: false,
@@ -1555,5 +1905,63 @@ mod tests {
         assert_eq!(grouped.len(), 1);
         assert!(grouped[0].required_chars.contains(&'A'));
         assert!(grouped[0].required_chars.contains(&'B'));
+    }
+
+    #[test]
+    fn check_subtitles_reports_missing_fonts_without_writing_output() {
+        use std::sync::Mutex;
+
+        struct RecordingReporter {
+            messages: Mutex<Vec<String>>,
+        }
+        impl super::ProgressReporter for RecordingReporter {
+            fn report(&self, message: String) {
+                self.messages.lock().unwrap().push(message);
+            }
+
+            fn cancelled(&self) -> bool {
+                false
+            }
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Empty font directory + no fonts.db: every request has to be reported
+        // as missing instead of failing the check.
+        let empty_fonts = std::env::temp_dir().join(format!("assfonts-empty-fonts-{unique}"));
+        std::fs::create_dir_all(&empty_fonts).unwrap();
+        let output = std::env::temp_dir().join(format!("assfonts-check-output-{unique}"));
+
+        let mut options = base_options(output.clone());
+        options.fontpaths = Some(vec![empty_fonts.clone()]);
+
+        let inputs = vec![PathBuf::from("examples/sample.ass")];
+        let reporter = RecordingReporter {
+            messages: Mutex::new(Vec::new()),
+        };
+        let summary = super::check_subtitles(&inputs, &options, &reporter).unwrap();
+
+        assert_eq!(summary.subtitle_count, 1);
+        assert!(summary.font_request_count > 0);
+        assert!(summary.font_reports.is_empty());
+        assert!(!summary.missing_fonts.is_empty());
+        assert!(
+            summary
+                .missing_fonts
+                .iter()
+                .any(|name| name.contains("Arial"))
+        );
+
+        let messages = reporter.messages.lock().unwrap();
+        assert!(messages.iter().any(|line| line.contains("需要字体")));
+        assert!(messages.iter().any(|line| line.contains("缺少字体")));
+        assert!(messages.iter().any(|line| line.contains("检查汇总")));
+        drop(messages);
+
+        // A check run must not create the output directory or any file.
+        assert!(!output.exists());
+        let _ = std::fs::remove_dir_all(&empty_fonts);
     }
 }

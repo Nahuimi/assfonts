@@ -68,6 +68,9 @@ assfonts -i /path/to/ass/files -o output_dir -f /path/to/fonts -d /path/to/db
 - `--muxer mkvmerge|ffmpeg`：mks/mkv 使用的封装器（默认 `mkvmerge`）
 - `--language <spec>`：字幕语言，如 `chi`（全部轨道）或 `.sc=chi;.tc=chi` 注释映射（内置 `.sc/.tc/.chs/.cht/...` 映射优先生效）
 - `--default-track <comment>`：指定为默认轨的字幕注释（文件名中媒体名之后的部分）
+- `--track-name-style english|chinese`：mks/mkv 轨道标题风格（默认 `english`，如 `KTXP.TC`；`chinese` 如 `极影字幕社.繁体`）
+- `--track-fansub-suffix <BOOL>`：轨道名是否包含字幕组后缀（默认 true）
+- `--track-language-suffix <BOOL>`：轨道名是否包含语言后缀（默认 true）
 - `--title <title>`：覆盖容器标题（默认为媒体文件名）
 - `--keep-subs` / `--keep-attachments`：保留输入媒体中原有的字幕轨/附件
 - `--use-embedded-fonts <BOOL>`：把输入字幕 `[Fonts]` 段内嵌的字体作为最高优先级字体源，二次处理已内嵌字幕无需系统安装字体（默认 true）

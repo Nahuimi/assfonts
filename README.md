@@ -68,6 +68,9 @@ Options:
 - `--muxer mkvmerge|ffmpeg`: External muxer used by mks/mkv (default: `mkvmerge`)
 - `--language <spec>`: Subtitle language, e.g. `chi` (all tracks) or `.sc=chi;.tc=chi` comment mappings (built-in defaults for `.sc/.tc/.chs/.cht/...` apply first)
 - `--default-track <comment>`: Subtitle filename comment (part after the media name) to mark as default
+- `--track-name-style english|chinese`: Track title style for mks/mkv (default: `english`, e.g. `KTXP.TC`; `chinese`, e.g. `极影字幕社.繁体`)
+- `--track-fansub-suffix <BOOL>`: Include the fansub-group suffix in track names (default: true)
+- `--track-language-suffix <BOOL>`: Include the language suffix in track names (default: true)
 - `--title <title>`: Override the container title (default: media file name)
 - `--keep-subs` / `--keep-attachments`: Keep original subtitle tracks/attachments of the input media
 - `--use-embedded-fonts <BOOL>`: Use fonts embedded in the input `[Fonts]` section as the highest-priority font source, so re-processing an embedded ASS needs no installed fonts (default: true)

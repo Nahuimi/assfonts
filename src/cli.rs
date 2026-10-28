@@ -145,6 +145,49 @@ pub struct RunOptions {
     pub default_track: Option<String>,
 
     #[arg(
+        long = "track-name-style",
+        value_enum,
+        default_value_t = crate::mux::job::TrackNameStyle::English,
+        value_name = "STYLE",
+        help = "mks/mkv track names: english (KTXP.TC) or chinese (极影字幕社.繁体)"
+    )]
+    pub track_name_style: crate::mux::job::TrackNameStyle,
+
+    #[arg(
+        long = "track-fansub-suffix",
+        action = ArgAction::Set,
+        default_value_t = true,
+        value_name = "BOOL",
+        help = "Include the fansub group suffix in mks/mkv track names"
+    )]
+    pub track_fansub_suffix: bool,
+
+    #[arg(
+        long = "track-language-suffix",
+        action = ArgAction::Set,
+        default_value_t = true,
+        value_name = "BOOL",
+        help = "Include the language suffix in mks/mkv track names"
+    )]
+    pub track_language_suffix: bool,
+
+    /// GUI-only: suffix categories loaded from gui.toml (empty = built-in table).
+    #[arg(skip)]
+    pub track_categories: Vec<crate::mux::job::SuffixCategory>,
+
+    /// GUI-only: fansub groups loaded from gui.toml (empty = built-in table).
+    #[arg(skip)]
+    pub track_groups: Vec<crate::mux::job::FansubGroup>,
+
+    /// GUI-only: per naming-key suffix overrides set from the table right-click menu.
+    #[arg(skip)]
+    pub track_overrides: std::collections::BTreeMap<String, crate::mux::job::SuffixOverride>,
+
+    /// GUI-only: naming keys whose subtitle track must be the default track.
+    #[arg(skip)]
+    pub default_track_keys: Vec<String>,
+
+    #[arg(
         long = "title",
         value_name = "TITLE",
         help = "Override the container title (default: media file name)"
