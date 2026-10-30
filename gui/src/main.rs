@@ -41,7 +41,7 @@ use gpui_kit::{
         ActiveTheme, TitleBar,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
-        menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
         scroll::{Scrollbar, ScrollbarMode},
         switch::Switch,
         theme::{Theme, ThemeMode},
@@ -55,7 +55,10 @@ use gpui_kit::{
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct GuiSettings {
     theme_choice: usize,
-    sidebar_collapsed: bool,
+    /// 固定侧边栏（true 时始终展开；false 时鼠标悬停才展开）。
+    /// 旧版本写的是 `sidebar_collapsed`，读取时按未知字段忽略。
+    #[serde(default = "default_true")]
+    sidebar_pinned: bool,
     format_index: usize,
     muxer_index: usize,
     strict_mode: bool,
@@ -68,8 +71,6 @@ struct GuiSettings {
     utf8_sig: bool,
     char_compatible: bool,
     use_embedded_fonts: bool,
-    #[serde(default)]
-    fontpaths: String,
     #[serde(default)]
     dbpath: String,
     #[serde(default)]
@@ -140,6 +141,11 @@ fn default_track_name_style() -> TrackNameStyle {
     TrackNameStyle::English
 }
 
+/// 侧边栏默认固定展开：自动收起是新行为，默认保持原来的常驻外观。
+fn default_true() -> bool {
+    true
+}
+
 fn load_settings() -> GuiSettings {
     let mut settings = std::fs::read_to_string(settings_path())
         .ok()
@@ -147,6 +153,7 @@ fn load_settings() -> GuiSettings {
         .unwrap_or_else(|| GuiSettings {
             video_exts: default_video_exts(),
             sub_exts: default_sub_exts(),
+            sidebar_pinned: true,
             ..GuiSettings::default()
         });
     // 空扩展名列表回退到内置列表：配置文件里看到的就是实际生效的默认值。
@@ -178,6 +185,36 @@ const PROCESS_COL_MAX: f32 = 620.;
 const MUXERS: [&str; 2] = ["mkvmerge", "ffmpeg"];
 const FORMATS: [&str; 3] = ["ass/ssa 内嵌字体", "mks 独立字幕", "mkv 封装视频"];
 const THEME_CHOICES: [&str; 3] = ["自动", "亮色", "暗色"];
+/// 字体页表格每页最多显示多少个字体；选择框在 100/300/500/1000 之间切换。
+const FONT_LIMITS: [usize; 4] = [100, 300, 500, 1000];
+/// 「显示前 N 条」触发按钮与弹出菜单共用的宽度。
+/// 菜单沿用触发按钮的宽度，左右边缘才和按钮对齐（下拉选择器的常规形态），
+/// 而不是按菜单项内容自行撑宽、只让左边贴住按钮。
+const FONT_LIMIT_SELECT_W: f32 = 100.;
+/// 字体表六列的标题。
+const FONT_COLUMNS: [&str; 6] = [
+    "path",
+    "display_name",
+    "normalized_name",
+    "inferred_weight",
+    "alias",
+    "normalized_alias",
+];
+/// 手动拖过列宽后的默认像素宽度；没拖过时按窗口可用宽度自适应。
+const FONT_COL_DEFAULTS: [f32; 6] = [220., 105., 115., 60., 110., 110.];
+/// 手没拖过列宽时按内容自适应，列宽上限防止单列过宽。
+const FONT_COL_MAX: f32 = 560.;
+/// 字体表列宽下限。
+const FONT_COL_MIN: f32 = 56.;
+
+/// 字体页表格的数据来源状态。
+enum FontRowsState {
+    /// 还没有请求过（第一次进入字体页时才读库）。
+    Idle,
+    Loading,
+    Loaded,
+    Error(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -190,11 +227,16 @@ enum Page {
 
 struct AssfontsApp {
     page: Page,
-    sidebar_collapsed: bool,
+    /// 固定侧边栏：true 时始终展开；false 时收起成图标条、鼠标悬停展开。
+    sidebar_pinned: bool,
+    /// 鼠标是否停在侧边栏上（仅内存状态，不影响布局宽度，只影响浮层展开）。
+    sidebar_hovered: bool,
     /// 0 = auto (system appearance), 1 = light, 2 = dark.
     theme_choice: usize,
 
     fontpaths_input: Entity<InputState>,
+    /// 字体页「索引字体目录」：重建 fonts.db 时扫描的目录，只在本次运行有效。
+    index_fontpaths_input: Entity<InputState>,
     dbpath_input: Entity<InputState>,
     output_input: Entity<InputState>,
     format_index: usize,
@@ -262,6 +304,8 @@ struct AssfontsApp {
     /// 处理页表格列宽：视频列、产物列（字幕列吃剩余宽度）。
     process_video_col: f32,
     process_product_col: f32,
+    /// 是否手动拖过处理页列宽；没拖过时按窗口宽度自适应。
+    process_col_custom: bool,
     /// 正在拖的列：0 = 视频列，1 = 产物列；附带按下位置与起始宽度。
     process_col_drag: Option<(u8, f32, f32)>,
     /// 表格的双向滚动位置；垂直/水平滚动条叠加在表格边缘。
@@ -269,9 +313,27 @@ struct AssfontsApp {
     rename_scroll_y: ScrollHandle,
     /// 日志页的纵向滚动位置；滚动条常驻日志框右缘。
     log_scroll_y: ScrollHandle,
-    /// 保持重命名页观察者的订阅存活（丢弃 Subscription 会取消订阅）。
+    /// 字体页表格：fonts.db 快照、搜索框内容、显示上限与双向滚动位置。
+    font_rows: Vec<assfonts::db::FontIndexRow>,
+    font_rows_state: FontRowsState,
+    /// 需要重新读取 fonts.db（换页、改 dbpath、重建索引完成后置位）。
+    font_rows_dirty: bool,
+    font_search_input: Entity<InputState>,
+    /// `FONT_LIMITS` 的下标。
+    font_limit_index: usize,
+    font_scroll_x: ScrollHandle,
+    font_scroll_y: ScrollHandle,
+    /// 字体表六列宽度；没手动拖过时按窗口宽度自适应。
+    font_cols: [f32; 6],
+    /// 是否手动拖过字体表列宽；拖过后改为固定宽度并显示横向滚动条。
+    font_col_custom: bool,
+    /// 正在拖动的字体表列：(列下标, 按下时的窗口 x, 按下时的列宽)。
+    font_col_drag: Option<(usize, f32, f32)>,
+    /// 重建索引正在跑；任务结束后自动刷新表格。
+    rebuild_in_flight: bool,
+    /// 保持输入框观察者的订阅存活（丢弃 Subscription 会取消订阅）。
     #[allow(dead_code)] // 只用于持有订阅，代码里不会读取
-    rename_input_subs: Vec<Subscription>,
+    input_subs: Vec<Subscription>,
     /// External tool availability shown in the title bar.
     tools_found: (bool, bool),
 }
@@ -524,21 +586,23 @@ impl AssfontsApp {
         };
 
         let fontpaths_input = make_input("字体目录，留空则只用 fonts.db");
-        let dbpath_input = make_input("fonts.db 所在目录，默认 .");
+        let index_fontpaths_input = make_input("重建索引时扫描的字体目录，多个用 ; 分隔");
+        let dbpath_input = make_input("fonts.db 所在的目录，留空用当前目录");
         let output_input = make_input("输出目录，默认 out");
         let custom_suffix_input = make_input("自定义后缀：输入什么就用什么，回车确认");
+        let font_search_input = make_input("搜索 path / 名称 / 别名 / 字重");
         let muxer_path_input = make_input("封装器可执行文件路径，留空用 PATH");
         let ffprobe_path_input = make_input("ffprobe 路径（仅 ffmpeg 需要），留空用 PATH");
 
-        apply_input(&fontpaths_input, &settings.fontpaths, window, cx);
+        // 处理页的字体目录只在本次运行有效，不从 gui.toml 恢复。
         apply_input(&dbpath_input, &settings.dbpath, window, cx);
         apply_input(&output_input, &settings.output, window, cx);
         apply_input(&muxer_path_input, &settings.muxer_path, window, cx);
         apply_input(&ffprobe_path_input, &settings.ffprobe_path, window, cx);
 
         // 行内自定义后缀：回车提交（空 = 清除覆盖，回到自动识别）。
-        let mut rename_input_subs = Vec::new();
-        rename_input_subs.push(cx.subscribe(
+        let mut input_subs = Vec::new();
+        input_subs.push(cx.subscribe(
             &custom_suffix_input,
             |this: &mut Self, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -546,12 +610,33 @@ impl AssfontsApp {
                 }
             },
         ));
+        // 字体页搜索：输入变化后重绘，表格在 render 里按关键字过滤。
+        input_subs.push(cx.subscribe(
+            &font_search_input,
+            |_this: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
+        // 改 fonts.db 目录后重新读库（下一次进入字体页或当页渲染时生效）。
+        input_subs.push(cx.subscribe(
+            &dbpath_input,
+            |this: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.font_rows_dirty = true;
+                    cx.notify();
+                }
+            },
+        ));
 
         let app = Self {
             page: Page::Process,
-            sidebar_collapsed: settings.sidebar_collapsed,
+            sidebar_pinned: settings.sidebar_pinned,
+            sidebar_hovered: false,
             theme_choice: settings.theme_choice,
             fontpaths_input,
+            index_fontpaths_input,
             dbpath_input,
             output_input,
             format_index: settings.format_index,
@@ -596,11 +681,23 @@ impl AssfontsApp {
             rename_col_drag: None,
             process_video_col: 230.,
             process_product_col: 200.,
+            process_col_custom: false,
             process_col_drag: None,
             rename_scroll_x: ScrollHandle::default(),
             rename_scroll_y: ScrollHandle::default(),
             log_scroll_y: ScrollHandle::default(),
-            rename_input_subs,
+            font_rows: Vec::new(),
+            font_rows_state: FontRowsState::Idle,
+            font_rows_dirty: false,
+            font_search_input,
+            font_limit_index: 0,
+            font_scroll_x: ScrollHandle::default(),
+            font_scroll_y: ScrollHandle::default(),
+            font_cols: FONT_COL_DEFAULTS,
+            font_col_custom: false,
+            font_col_drag: None,
+            rebuild_in_flight: false,
+            input_subs,
             // PATH lookup only — no subprocess (a GUI parent would flash consoles).
             tools_found: (
                 mux::find_on_path("mkvmerge").is_some(),
@@ -618,7 +715,7 @@ impl AssfontsApp {
     fn persist(&self, cx: &App) {
         let settings = GuiSettings {
             theme_choice: self.theme_choice,
-            sidebar_collapsed: self.sidebar_collapsed,
+            sidebar_pinned: self.sidebar_pinned,
             format_index: self.format_index,
             muxer_index: self.muxer_index,
             strict_mode: self.strict_mode,
@@ -631,7 +728,6 @@ impl AssfontsApp {
             utf8_sig: self.utf8_sig,
             char_compatible: self.char_compatible,
             use_embedded_fonts: self.use_embedded_fonts,
-            fontpaths: self.input_value(&self.fontpaths_input, cx),
             dbpath: self.input_value(&self.dbpath_input, cx),
             output: self.input_value(&self.output_input, cx),
             // 配置里写实际生效的默认值（而不是空字符串），打开 `gui.toml` 就能
@@ -681,6 +777,54 @@ impl AssfontsApp {
 
     fn input_value(&self, state: &Entity<InputState>, cx: &App) -> String {
         state.read(cx).value().to_string()
+    }
+
+    /// 字体页读取 fonts.db 的目录：输入框留空时用当前目录。
+    fn font_dbpath(&self, cx: &App) -> PathBuf {
+        let value = self.input_value(&self.dbpath_input, cx);
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            PathBuf::from(".")
+        } else {
+            PathBuf::from(trimmed)
+        }
+    }
+
+    /// 后台读取 fonts.db 的全部字体行；读完后更新表格状态并重绘。
+    fn reload_font_index(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.font_rows_state, FontRowsState::Loading) {
+            return;
+        }
+        self.font_rows_dirty = false;
+        self.font_rows_state = FontRowsState::Loading;
+        let dbpath = self.font_dbpath(cx);
+        let (tx, rx) = smol::channel::unbounded::<
+            std::result::Result<Vec<assfonts::db::FontIndexRow>, String>,
+        >();
+        std::thread::spawn(move || {
+            let result = assfonts::db::load_font_index(&dbpath).map_err(|err| err.to_string());
+            let _ = tx.send_blocking(result);
+        });
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            if let Ok(result) = rx.recv().await {
+                let _ = weak.update(cx, |this, cx| {
+                    match result {
+                        Ok(rows) => {
+                            this.font_rows = rows;
+                            this.font_rows_state = FontRowsState::Loaded;
+                        }
+                        Err(err) => {
+                            this.font_rows = Vec::new();
+                            this.font_rows_state = FontRowsState::Error(err);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     fn collect_options(&self, cx: &App) -> Result<RunOptions, String> {
@@ -1257,6 +1401,7 @@ impl AssfontsApp {
         } else {
             self.process_product_col
         };
+        self.process_col_custom = true;
         self.process_col_drag = Some((which, x, start));
     }
 
@@ -1287,6 +1432,32 @@ impl AssfontsApp {
 
     fn end_process_col_drag(&mut self) {
         self.process_col_drag = None;
+    }
+
+    /// 字体表列宽把手按下：自适应模式下先把当前屏幕宽度写回固定宽度再拖。
+    fn start_font_col_drag(&mut self, column: usize, x: f32, columns: [f32; 6]) {
+        if column < self.font_cols.len() {
+            self.font_cols = columns;
+            self.font_col_custom = true;
+            self.font_col_drag = Some((column, x, self.font_cols[column]));
+        }
+    }
+
+    /// 字体表列宽拖动；返回是否真的变了。
+    fn drag_font_col(&mut self, x: f32) -> bool {
+        let Some((column, start_x, start_width)) = self.font_col_drag else {
+            return false;
+        };
+        let width = (start_width + (x - start_x)).max(FONT_COL_MIN);
+        if (width - self.font_cols[column]).abs() < 0.5 {
+            return false;
+        }
+        self.font_cols[column] = width;
+        true
+    }
+
+    fn end_font_col_drag(&mut self) {
+        self.font_col_drag = None;
     }
 
     /// 执行表格中所有“就绪”的行（按当前设置重命名或复制），随后重扫。
@@ -1381,10 +1552,12 @@ impl AssfontsApp {
         h_flex()
             .items_center()
             .justify_between()
+            .gap_3()
             .py_1p5()
             .child(
                 v_flex()
-                    .max_w(px(520.))
+                    .flex_1()
+                    .min_w_0()
                     .child(div().text_size(px(13.5)).child(title))
                     .child(
                         div()
@@ -1406,13 +1579,13 @@ impl AssfontsApp {
             )
     }
 
-    /// 自绘侧边栏：布局完全自控，折叠/展开两种状态共用同一套内边距与
-    /// 恒定高度的标题行，菜单起始位置不随折叠变化（此前组件 Sidebar 在
-    /// 折叠态对头部与内容区有不对称的内边距调整，补偿无法对齐）。
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    /// 自绘侧边栏：布局完全自控。固定（pinned）时始终展开；未固定时收起成
+    /// 48px 图标条，鼠标悬停时以绝对定位浮层展开并盖住页面内容（不挤动布局）。
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
-        let collapsed = self.sidebar_collapsed;
-        let width = if collapsed { 48. } else { 210. };
+        let overlay = !self.sidebar_pinned;
+        let width = sidebar_width(self.sidebar_pinned, self.sidebar_hovered);
+        let collapsed = width <= 48.;
         let sidebar_bg = cx.theme().sidebar;
         let sidebar_fg = cx.theme().sidebar_foreground;
         let sidebar_border = cx.theme().sidebar_border;
@@ -1423,21 +1596,30 @@ impl AssfontsApp {
             let toggle_entity = entity.clone();
             Button::new("sidebar-toggle")
                 .ghost()
-                .icon(Icon::new(if collapsed {
-                    IconName::PanelLeftOpen
+                .icon(Icon::new(if self.sidebar_pinned {
+                    IconName::Pin
                 } else {
-                    IconName::PanelLeftClose
+                    IconName::PinOff
                 }))
+                .tooltip(if self.sidebar_pinned {
+                    "取消固定（鼠标移开自动收起）"
+                } else {
+                    "固定侧边栏"
+                })
                 .on_click(move |_, _, cx| {
                     toggle_entity.update(cx, |this, cx| {
-                        this.sidebar_collapsed = !this.sidebar_collapsed;
+                        this.sidebar_pinned = !this.sidebar_pinned;
+                        // 刚取消固定时指针还停在侧边栏上：先保持展开，离开后再收起。
+                        if !this.sidebar_pinned {
+                            this.sidebar_hovered = true;
+                        }
                         this.persist(cx);
                         cx.notify();
                     });
                 })
         };
 
-        // 标题行两种状态恒定 32px 高：折叠时仅折叠按钮居中。
+        // 标题行高度恒定：收起时仅固定按钮居中，展开时是标题 + 固定按钮。
         let header = if collapsed {
             h_flex()
                 .h(px(32.))
@@ -1483,6 +1665,10 @@ impl AssfontsApp {
                     .on_click(move |_, _, cx| {
                         nav_entity.update(cx, |this, cx| {
                             this.page = page;
+                            if page == Page::Fonts {
+                                // 字体页表格需要最新的 fonts.db 快照。
+                                this.font_rows_dirty = true;
+                            }
                             cx.notify();
                         });
                     });
@@ -1500,7 +1686,8 @@ impl AssfontsApp {
                 }
             };
 
-        v_flex()
+        let root = v_flex()
+            .id("app-sidebar")
             .flex_shrink_0()
             .h_full()
             .w(px(width))
@@ -1533,13 +1720,34 @@ impl AssfontsApp {
                 Page::Settings,
             ))
             .child(div().flex_1())
-            .child(self.render_theme_footer(cx))
+            .child(self.render_theme_footer(cx));
+
+        // 未固定：脱离文档流，展开/收起不会挤动右侧页面。
+        let root = if overlay {
+            root.absolute().top_0().bottom_0().left_0()
+        } else {
+            root
+        };
+
+        // 鼠标进入 48px 图标条就展开；离开展开后的区域才收起（布局变化时
+        // gpui 会重新触发 hover，所以来回移动不会卡在中间态）。
+        let hover_entity = cx.entity().downgrade();
+        root.on_hover(move |hovered, _, cx| {
+            let hovered = *hovered;
+            let _ = hover_entity.update(cx, |this, cx| {
+                if this.sidebar_hovered != hovered {
+                    this.sidebar_hovered = hovered;
+                    cx.notify();
+                }
+            });
+        })
+        .into_any_element()
     }
 
     /// 侧边栏底部的主题切换：图标随当前生效模式变化，点击在 自动/亮色/暗色 间循环。
     fn render_theme_footer(&self, cx: &mut Context<Self>) -> Div {
         let entity = cx.entity();
-        let collapsed = self.sidebar_collapsed;
+        let collapsed = !(self.sidebar_pinned || self.sidebar_hovered);
         let theme_label = THEME_CHOICES[self.theme_choice % THEME_CHOICES.len()];
         let theme_icon = match resolve_theme_mode(self.theme_choice, cx) {
             ThemeMode::Dark => IconName::Moon,
@@ -1584,7 +1792,7 @@ impl AssfontsApp {
         self.persist(cx);
     }
 
-    fn render_process(&self, cx: &mut Context<Self>) -> Div {
+    fn render_process(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let running = self.running;
         let entity = cx.entity();
         let muxer_entity = entity.clone();
@@ -1652,8 +1860,18 @@ impl AssfontsApp {
         };
         let clear_entity = entity.clone();
         let accent = cx.theme().primary;
-        let video_col = self.process_video_col;
-        let product_col = self.process_product_col;
+        // 没手动拖过列宽时，视频列/产物列按窗口可用宽度自适应；字幕列吃剩余宽度。
+        let sidebar = if self.sidebar_pinned { 210. } else { 48. };
+        let usable = (f32::from(window.viewport_size().width) - sidebar - 54.)
+            .max(PROCESS_COL_MIN * 2. + 160.);
+        let (video_col, product_col) = if self.process_col_custom {
+            (self.process_video_col, self.process_product_col)
+        } else {
+            (
+                (usable * 0.20).clamp(PROCESS_COL_MIN, PROCESS_COL_MAX),
+                (usable * 0.16).clamp(PROCESS_COL_MIN, PROCESS_COL_MAX),
+            )
+        };
         let down_video = entity.clone();
         let down_product = entity.clone();
         let col_move = entity.clone();
@@ -2206,30 +2424,503 @@ impl AssfontsApp {
             ))
     }
 
-    fn render_fonts(&self, cx: &mut Context<Self>) -> Div {
+    fn render_fonts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // 重建索引结束后自动刷新表格。
+        if self.rebuild_in_flight && !self.running {
+            self.rebuild_in_flight = false;
+            self.font_rows_dirty = true;
+        }
+        if self.font_rows_dirty {
+            self.reload_font_index(cx);
+        }
+
         let entity = cx.entity();
+        let muted = muted_foreground(cx);
+        let border = card_border(cx);
+        let accent = cx.theme().primary;
+        let db_entity = entity.clone();
+        let index_entity = entity.clone();
+        let rebuild_entity = entity.clone();
+        let db_state = self.dbpath_input.clone();
+        let index_state = self.index_fontpaths_input.clone();
+
+        // 搜索与显示上限：表格按 path 合并成字体组，只渲染过滤后的前 N 组。
+        let query = self.input_value(&self.font_search_input, cx);
+        let query_lower = query.trim().to_lowercase();
+        let limit = FONT_LIMITS[self.font_limit_index % FONT_LIMITS.len()];
+        let groups = group_font_rows(&self.font_rows, &query_lower, limit);
+        let group_count = group_font_rows(&self.font_rows, &query_lower, usize::MAX).len();
+        let shown = groups.len();
+
+        // 没手动拖过列宽时按内容自适应（列宽随文字变宽、超长时省略号），
+        // 拖过之后改为固定宽度并显示横向滚动条。
+        // 可用宽度 = 窗口 - 侧边栏 - 页面左右内边距(32) - 卡片边框(2) - 纵向滚动条(12) - 余量(8)。
+        let sidebar = if self.sidebar_pinned { 210. } else { 48. };
+        let usable = (f32::from(window.viewport_size().width) - sidebar - 54.)
+            .max(FONT_COL_MIN * FONT_COLUMNS.len() as f32);
+        let columns = if self.font_col_custom {
+            self.font_cols
+        } else {
+            let mut columns = font_column_widths(&groups);
+            let total: f32 = columns.iter().sum();
+            if total < usable {
+                // 内容没占满时各列按比例放大，表格铺满可用宽度且列宽仍然均衡。
+                let scale = usable / total;
+                for width in &mut columns {
+                    *width *= scale;
+                }
+            }
+            columns
+        };
+        let table_width: f32 = columns.iter().sum();
+        // 表头每列右缘一个 8px 拖拽把手；标题与内容都居中。
+        let header_cell = |title: &'static str, column: usize| -> Div {
+            let resize_entity = entity.clone();
+            let mut cell = div()
+                .w(px(columns[column]))
+                .flex_none()
+                .flex_shrink_0()
+                .relative()
+                .px_2()
+                .py_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(column + 1 < FONT_COLUMNS.len(), |this| {
+                    this.border_r_1().border_color(border)
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_center()
+                        .text_size(px(11.5))
+                        .text_color(muted)
+                        .child(title),
+                );
+            if column + 1 < FONT_COLUMNS.len() {
+                cell = cell.child(
+                    div()
+                        .id(("font-col-handle", column))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(8.))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .hover(move |style| style.bg(accent.opacity(0.45)))
+                        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                            let x = f32::from(event.position.x);
+                            resize_entity.update(cx, |this, cx| {
+                                this.start_font_col_drag(column, x, columns);
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            cell
+        };
+        let header = h_flex()
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(border)
+            .children(
+                (0..FONT_COLUMNS.len()).map(|column| header_cell(FONT_COLUMNS[column], column)),
+            );
+
+        let cell_text = |text: Option<String>, column: usize| -> Div {
+            div()
+                .w(px(columns[column]))
+                .flex_none()
+                .flex_shrink_0()
+                .px_2()
+                .py_1()
+                .text_size(px(12.))
+                .when(column + 1 < FONT_COLUMNS.len(), |this| {
+                    this.border_r_1().border_color(border)
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_center()
+                        .child(text.unwrap_or_default()),
+                )
+        };
+
+        // 合并单元格：字体级字段只在组内显示一次，纵向撑满整组的高度（Excel 合并效果）。
+        let font_cell = |text: Option<String>, column: usize| -> Div {
+            div()
+                .w(px(columns[column]))
+                .flex_none()
+                .flex_shrink_0()
+                .px_2()
+                .text_size(px(12.))
+                .when(column + 1 < FONT_COLUMNS.len(), |this| {
+                    this.border_r_1().border_color(border)
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_center()
+                        .child(text.unwrap_or_default()),
+                )
+        };
+
+        let empty_hint = |text: String| -> AnyElement {
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .child(div().text_size(px(12.5)).text_color(muted).child(text))
+                .into_any_element()
+        };
+
+        let rows_content: AnyElement = match &self.font_rows_state {
+            FontRowsState::Idle | FontRowsState::Loading => {
+                empty_hint("正在读取字体索引…".to_string())
+            }
+            FontRowsState::Error(err) => empty_hint(format!("读取 fonts.db 失败：{err}")),
+            FontRowsState::Loaded if self.font_rows.is_empty() => empty_hint(
+                "fonts.db 里还没有字体：在下方填好「索引字体目录」后点「重建索引」。".to_string(),
+            ),
+            FontRowsState::Loaded if group_count == 0 => {
+                empty_hint(format!("没有匹配“{}”的字体。", query.trim()))
+            }
+            FontRowsState::Loaded => {
+                let mut rows: Vec<AnyElement> = Vec::new();
+                for (group_index, group) in groups.iter().enumerate() {
+                    let row = group.row;
+                    let path = if row.face_index == 0 {
+                        row.path.clone()
+                    } else {
+                        format!("{}#{}", row.path, row.face_index)
+                    };
+                    // 同一个 path 合并成一组：字体级字段在组内合并为一个纵向撑满的单元格，
+                    // 每个 alias 单独一行，占两列。
+                    let aliases: Vec<(&str, &str)> = if group.aliases.is_empty() {
+                        vec![("—", "—")]
+                    } else {
+                        group.aliases.clone()
+                    };
+                    let mut alias_cells: Vec<AnyElement> = Vec::new();
+                    let mut normalized_alias_cells: Vec<AnyElement> = Vec::new();
+                    for (alias, normalized_alias) in &aliases {
+                        alias_cells
+                            .push(cell_text(Some((*alias).to_string()), 4).into_any_element());
+                        normalized_alias_cells.push(
+                            cell_text(Some((*normalized_alias).to_string()), 5).into_any_element(),
+                        );
+                    }
+                    rows.push(
+                        h_flex()
+                            .w_full()
+                            .items_stretch()
+                            .border_b_1()
+                            .border_color(border)
+                            .when(group_index % 2 == 1, |this| this.bg(muted.opacity(0.06)))
+                            .child(font_cell(Some(path), 0))
+                            .child(font_cell(Some(row.display_name.clone()), 1))
+                            .child(font_cell(Some(row.normalized_name.clone()), 2))
+                            .child(font_cell(Some(row.inferred_weight.to_string()), 3))
+                            .child(v_flex().flex_none().w(px(columns[4])).children(alias_cells))
+                            .child(
+                                v_flex()
+                                    .flex_none()
+                                    .w(px(columns[5]))
+                                    .children(normalized_alias_cells),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                v_flex().w_full().children(rows).into_any_element()
+            }
+        };
+
+        // 横向滚动包住表头和行区，纵向滚动只作用于行区；两条滚动条常驻
+        // 表格边缘，竖滚轮滚行区、Shift+滚轮横向滚动。
+        let table_area = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .child(
+                // 右下留出常驻滚动条的位置，滚动条画在外层，不遮住文字。
+                div().size_full().pr(px(12.)).pb(px(12.)).child(
+                    div()
+                        .id("font-scroll-x")
+                        .size_full()
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&self.font_scroll_x)
+                        .child(
+                            v_flex()
+                                .min_w(px(table_width))
+                                .w_full()
+                                .h_full()
+                                .child(header)
+                                .child(
+                                    div().flex_1().min_h_0().child(
+                                        div()
+                                            .id("font-scroll-y")
+                                            .size_full()
+                                            .overflow_y_scroll()
+                                            .restrict_scroll_to_axis()
+                                            .track_scroll(&self.font_scroll_y)
+                                            .child(rows_content),
+                                    ),
+                                ),
+                        ),
+                ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom(px(12.))
+                    .right_0()
+                    .w(px(12.))
+                    .child(
+                        Scrollbar::vertical(&self.font_scroll_y)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right(px(12.))
+                    .bottom_0()
+                    .h(px(12.))
+                    .child(
+                        Scrollbar::horizontal(&self.font_scroll_x)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            );
+
+        let limit_entity = entity.clone();
+        let current_limit_index = self.font_limit_index % FONT_LIMITS.len();
+        let limit_label = format!("{limit} 条");
+        let toolbar = h_flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .child(div().text_size(px(12.)).text_color(muted).child("显示前"))
+            .child(
+                Button::new("font-limit")
+                    .ghost()
+                    // 固定宽度，切换 100/300/500/1000 时按钮与后面的搜索框不会左右跳动；
+                    // 高度用默认中等尺寸（h_8），与搜索框对齐。
+                    .w(px(FONT_LIMIT_SELECT_W))
+                    .label(limit_label)
+                    .dropdown_caret(true)
+                    // 菜单右下角贴住按钮右下角，配合菜单同宽，左右边缘都对齐。
+                    .dropdown_menu_with_anchor(
+                        Anchor::TopRight,
+                        move |menu: PopupMenu,
+                              _window: &mut Window,
+                              _cx: &mut Context<PopupMenu>| {
+                            // 菜单默认按内容/最小宽度撑开，会比按钮宽出一截；
+                            // 这里锁定成按钮宽度，左右边缘与触发按钮对齐。
+                            let mut menu = menu
+                                .min_w(px(FONT_LIMIT_SELECT_W))
+                                .max_w(px(FONT_LIMIT_SELECT_W));
+                            for (index, count) in FONT_LIMITS.iter().enumerate() {
+                                let item_entity = limit_entity.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(format!("{count} 条"))
+                                        .checked(index == current_limit_index)
+                                        .on_click(move |_, _, cx| {
+                                            item_entity.update(cx, |this, cx| {
+                                                this.font_limit_index = index;
+                                                cx.notify();
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.font_search_input)),
+            )
+            .child({
+                let mut info = if query_lower.is_empty() {
+                    format!("共 {group_count} 个字体")
+                } else {
+                    format!("匹配 {group_count} 个字体")
+                };
+                if group_count > shown {
+                    info.push_str(&format!("；只显示前 {shown} 个字体"));
+                }
+                div().text_size(px(11.5)).text_color(muted).child(info)
+            });
+
+        let col_move = entity.clone();
+        let col_up = entity.clone();
+        let col_up_out = entity.clone();
+        let table_card = div()
+            .w_full()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(border)
+            .bg(card_background(cx))
+            .p_3()
+            .flex_1()
+            .min_h(px(220.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .on_mouse_move(move |event, _, cx| {
+                let x = f32::from(event.position.x);
+                col_move.update(cx, |this, cx| {
+                    if this.drag_font_col(x) {
+                        cx.notify();
+                    }
+                });
+            })
+            .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                col_up.update(cx, |this, _| this.end_font_col_drag());
+            })
+            .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                col_up_out.update(cx, |this, _| this.end_font_col_drag());
+            })
+            .child(toolbar)
+            .child(table_area);
+
         v_flex()
+            .id("fonts-page")
             .p_4()
             .gap_3()
+            .h_full()
+            .overflow_y_scroll()
             .child(Self::page_header(cx, "字体", "字体索引与字体库维护"))
+            .child(table_card)
             .child(Self::card(
                 cx,
-                v_flex().gap_2()
-                    .child(div().text_size(px(13.5)).child("重建字体索引 (fonts.db)"))
+                v_flex()
+                    .gap_2()
                     .child(
-                        div().text_size(px(11.5)).text_color(muted_foreground(cx)).child(
-                            "扫描处理页填写的字体目录并重建 fonts.db；输出目录取 fonts.db 所在目录输入",
-                        ),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(92.))
+                                    .flex_none()
+                                    .text_size(px(13.5))
+                                    .child("fonts.db 目录"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .on_drop::<ExternalPaths>(move |files, window, cx| {
+                                        db_entity.update(cx, |this, cx| {
+                                            this.adopt_dropped_paths(
+                                                &db_state,
+                                                DropMode::Replace,
+                                                &files.0,
+                                                window,
+                                                cx,
+                                            );
+                                            this.persist(cx);
+                                        });
+                                    })
+                                    .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                                        style
+                                            .border_1()
+                                            .border_color(cx.theme().primary.opacity(0.7))
+                                    })
+                                    .child(Input::new(&self.dbpath_input)),
+                            ),
                     )
                     .child(
-                        Button::new("rebuild")
-                            .primary()
-                            .label("重建索引")
-                            .on_click(move |_, _, cx| {
-                                run_build_clicked(&entity, cx);
-                            }),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(92.))
+                                    .flex_none()
+                                    .text_size(px(13.5))
+                                    .child("索引字体目录"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .on_drop::<ExternalPaths>(move |files, window, cx| {
+                                        index_entity.update(cx, |this, cx| {
+                                            this.adopt_dropped_paths(
+                                                &index_state,
+                                                DropMode::Append,
+                                                &files.0,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    })
+                                    .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                                        style
+                                            .border_1()
+                                            .border_color(cx.theme().primary.opacity(0.7))
+                                    })
+                                    .child(Input::new(&self.index_fontpaths_input)),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(92.))
+                                    .flex_none()
+                                    .text_size(px(13.5))
+                                    .child("重建字体索引"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(11.5))
+                                    .text_color(muted)
+                                    .child("扫描上面的索引字体目录重建 fonts.db；输出到 fonts.db 所在目录"),
+                            )
+                            .child(Button::new("rebuild").primary().label("重建索引").on_click(
+                                move |_, _, cx| {
+                                    run_build_clicked(&rebuild_entity, cx);
+                                },
+                            )),
                     ),
             ))
+            .into_any_element()
     }
 
     fn render_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
@@ -2244,7 +2935,8 @@ impl AssfontsApp {
         let has_scan = self.rename_scan.is_some();
         // 没手动拖过列宽时，三列按窗口可用宽度自适应，打开就不再出现横向滚动条。
         // 可用宽度 = 窗口 - 侧边栏 - 页面左右内边距(32) - 卡片边框(2) - 纵向滚动条(12) - 余量(8)。
-        let sidebar = if self.sidebar_collapsed { 48. } else { 210. };
+        // 可用宽度只算布局宽度：未固定时侧边栏是浮层，悬停展开不会改变页面宽度。
+        let sidebar = if self.sidebar_pinned { 210. } else { 48. };
         let usable =
             (f32::from(window.viewport_size().width) - sidebar - 54.).max(RENAME_COL_MIN * 3.);
         let columns = if self.rename_col_custom {
@@ -2630,8 +3322,8 @@ impl AssfontsApp {
         let muxer_entity = entity.clone();
         let track_entity = entity.clone();
         let track_label = match self.track_name_style {
-            TrackNameStyle::English => "英文（KTXP.TC）",
-            TrackNameStyle::Chinese => "中文（极影字幕社.繁体）",
+            TrackNameStyle::English => "英文",
+            TrackNameStyle::Chinese => "中文",
         };
         v_flex()
             .p_4()
@@ -2757,51 +3449,15 @@ impl AssfontsApp {
                             ),
                     )
                     .child(
-                        v_flex()
-                            .py_1p5()
-                            .gap_1()
-                            .child(div().text_size(px(13.5)).child("fonts.db 目录"))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(muted_foreground(cx))
-                                    .child("字体索引 fonts.db 所在的目录，留空用当前目录"),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .on_drop::<ExternalPaths>({
-                                        let drop_entity = entity.clone();
-                                        let state = self.dbpath_input.clone();
-                                        move |files, window, cx| {
-                                            drop_entity.update(cx, |this, cx| {
-                                                this.adopt_dropped_paths(
-                                                    &state,
-                                                    DropMode::Replace,
-                                                    &files.0,
-                                                    window,
-                                                    cx,
-                                                );
-                                                this.persist(cx);
-                                            });
-                                        }
-                                    })
-                                    .drag_over::<ExternalPaths>(|style, _, _, cx| {
-                                        style
-                                            .border_1()
-                                            .border_color(cx.theme().primary.opacity(0.7))
-                                    })
-                                    .child(Input::new(&self.dbpath_input)),
-                            ),
-                    )
-                    .child(
                         h_flex()
                             .items_center()
                             .justify_between()
+                            .gap_3()
                             .py_1p5()
                             .child(
                                 v_flex()
-                                    .max_w(px(520.))
+                                    .flex_1()
+                                    .min_w_0()
                                     .child(div().text_size(px(13.5)).child("封装器"))
                                     .child(
                                         div()
@@ -2827,23 +3483,26 @@ impl AssfontsApp {
                         h_flex()
                             .items_center()
                             .justify_between()
+                            .gap_3()
                             .py_1p5()
                             .child(
                                 v_flex()
-                                    .max_w(px(560.))
+                                    .flex_1()
+                                    .min_w_0()
                                     .child(div().text_size(px(13.5)).child("字幕轨命名"))
                                     .child(
                                         div()
                                             .text_size(px(11.5))
                                             .text_color(muted_foreground(cx))
                                             .child(
-                                                "mks/mkv 字幕轨标题用哪个后缀名；轨道语言标记按语言后缀自动设置（简体→zh-Hans、繁体→zh-Hant、日语→jpn、英语→eng）",
+                                                "mks/mkv 字幕轨标题用哪个后缀名；轨道语言标记按语言后缀自动设置",
                                             ),
                                     ),
                             )
                             .child(
                                 Button::new("track-name-style")
                                     .label(track_label)
+                                    .tooltip("英文：KTXP.TC；中文：极影字幕社.繁体（语言标记：简体→zh-Hans、繁体→zh-Hant、日语→jpn、英语→eng）")
                                     .on_click(move |_, _, cx| {
                                         track_entity.update(cx, |this, cx| {
                                             this.track_name_style =
@@ -3300,9 +3959,9 @@ fn run_build_clicked(entity: &Entity<AssfontsApp>, cx: &mut App) {
         }
         let weak = cx.entity().downgrade();
         this.persist(cx);
-        let fontpaths = split_paths(&this.input_value(&this.fontpaths_input, cx));
+        let fontpaths = split_paths(&this.input_value(&this.index_fontpaths_input, cx));
         if fontpaths.is_empty() {
-            this.push_log("[错误] 请先在处理页填写字体目录".to_string());
+            this.push_log("[错误] 请先在字体页填写索引字体目录".to_string());
             return;
         }
         let dbpath_value = this.input_value(&this.dbpath_input, cx);
@@ -3318,6 +3977,8 @@ fn run_build_clicked(entity: &Entity<AssfontsApp>, cx: &mut App) {
             })
         {
             this.push_log(message);
+            // 重建结束后字体页会重新读取 fonts.db。
+            this.rebuild_in_flight = true;
         }
         cx.notify();
     });
@@ -3326,12 +3987,47 @@ fn run_build_clicked(entity: &Entity<AssfontsApp>, cx: &mut App) {
 impl Render for AssfontsApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.page {
-            Page::Process => self.render_process(cx).into_any_element(),
-            Page::Fonts => self.render_fonts(cx).into_any_element(),
+            Page::Process => self.render_process(window, cx).into_any_element(),
+            Page::Fonts => self.render_fonts(window, cx).into_any_element(),
             Page::Rename => self.render_rename(window, cx).into_any_element(),
             Page::Logs => self.render_logs(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
         };
+        // 重命名页、日志页与字体页自带内部滚动，整页不再滚动：外层滚动容器会
+        // 让内部滚动区拿不到确定高度（窗口缩放后只占页面一部分）。
+        let page = if matches!(self.page, Page::Rename | Page::Logs | Page::Fonts) {
+            v_flex()
+                .h_full()
+                .flex_1()
+                .min_w_0()
+                .child(content)
+                .into_any_element()
+        } else {
+            v_flex()
+                .id("page-scroll")
+                // h_flex 的交叉轴默认是 items_center：列不占行高，
+                // 滚动区域必须显式 h_full 才能以行高为视口（见 gpui-base StyledExt 文档）。
+                .h_full()
+                .flex_1()
+                .min_w_0()
+                .overflow_y_scroll()
+                .child(content)
+                .into_any_element()
+        };
+
+        let pinned = self.sidebar_pinned;
+        let mut row = h_flex().flex_1().min_h_0().relative();
+        if pinned {
+            row = row.child(self.render_sidebar(cx));
+        } else {
+            // 未固定时侧边栏是浮层：只占 48px 图标条的位置，悬停展开不挤动页面。
+            row = row.child(div().w(px(48.)).flex_shrink_0().h_full());
+        }
+        row = row.child(page);
+        if !pinned {
+            // 浮层最后绘制，展开后才盖在页面内容之上。
+            row = row.child(self.render_sidebar(cx));
+        }
 
         v_flex()
             .size_full()
@@ -3344,34 +4040,111 @@ impl Render for AssfontsApp {
                         .child("assfonts"),
                 ),
             )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_sidebar(cx))
-                    // 重命名页与日志页自带内部滚动，整页不再滚动：外层滚动容器会
-                    // 让内部滚动区拿不到确定高度（窗口缩放后只占页面一部分）。
-                    .child(if matches!(self.page, Page::Rename | Page::Logs) {
-                        v_flex()
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .child(content)
-                            .into_any_element()
-                    } else {
-                        v_flex()
-                            .id("page-scroll")
-                            // h_flex 的交叉轴默认是 items_center：列不占行高，
-                            // 滚动区域必须显式 h_full 才能以行高为视口（见 gpui-base StyledExt 文档）。
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_y_scroll()
-                            .child(content)
-                            .into_any_element()
-                    }),
-            )
+            .child(row)
     }
+}
+
+/// 字体页的搜索匹配：不区分大小写，命中路径、名称、别名或字重任意一项即可。
+fn font_row_matches(row: &assfonts::db::FontIndexRow, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    let contains = |text: &str| text.to_lowercase().contains(query_lower);
+    contains(&row.path)
+        || contains(&row.display_name)
+        || contains(&row.normalized_name)
+        || row.inferred_weight.to_string().contains(query_lower)
+        || row
+            .aliases
+            .iter()
+            .any(|alias| contains(&alias.alias) || contains(&alias.normalized_alias))
+}
+
+/// 字体表按 path 合并后的一组：字体级字段只显示一次，alias 一行一个。
+struct FontGroup<'a> {
+    row: &'a assfonts::db::FontIndexRow,
+    aliases: Vec<(&'a str, &'a str)>,
+}
+
+/// 按 path 合并匹配的字体行；不同 face 的 alias 归到同一组并去重。
+/// `limit` 限制显示的字体组数（不是 alias 行数）。
+fn group_font_rows<'a>(
+    rows: &'a [assfonts::db::FontIndexRow],
+    query_lower: &str,
+    limit: usize,
+) -> Vec<FontGroup<'a>> {
+    let mut groups: Vec<FontGroup<'a>> = Vec::new();
+    let mut paths: Vec<&'a str> = Vec::new();
+    for row in rows {
+        if !font_row_matches(row, query_lower) {
+            continue;
+        }
+        let position = match paths.iter().position(|path| *path == row.path.as_str()) {
+            Some(position) => position,
+            None => {
+                paths.push(row.path.as_str());
+                groups.push(FontGroup {
+                    row,
+                    aliases: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[position];
+        for alias in &row.aliases {
+            let duplicate = group.aliases.iter().any(|(text, normalized)| {
+                *text == alias.alias.as_str() && *normalized == alias.normalized_alias.as_str()
+            });
+            if !duplicate {
+                group
+                    .aliases
+                    .push((alias.alias.as_str(), alias.normalized_alias.as_str()));
+            }
+        }
+    }
+    groups.truncate(limit);
+    groups
+}
+
+/// 估算一段文字在 12px 字号下的像素宽度（ASCII 与 CJK 分开近似）。
+fn estimate_text_width(text: &str) -> f32 {
+    text.chars()
+        .map(|character| if character.is_ascii() { 6.8 } else { 12.2 })
+        .sum::<f32>()
+        + 20.
+}
+
+/// 按当前显示的数据计算字体表各列的自适应宽度。
+fn font_column_widths(groups: &[FontGroup<'_>]) -> [f32; 6] {
+    let mut widths = [FONT_COL_MIN; FONT_COLUMNS.len()];
+    for (index, title) in FONT_COLUMNS.iter().enumerate() {
+        widths[index] = widths[index].max(estimate_text_width(title));
+    }
+    for group in groups {
+        let row = group.row;
+        let path = if row.face_index == 0 {
+            row.path.clone()
+        } else {
+            format!("{}#{}", row.path, row.face_index)
+        };
+        widths[0] = widths[0].max(estimate_text_width(&path));
+        widths[1] = widths[1].max(estimate_text_width(&row.display_name));
+        widths[2] = widths[2].max(estimate_text_width(&row.normalized_name));
+        widths[3] = widths[3].max(estimate_text_width(&row.inferred_weight.to_string()));
+        if group.aliases.is_empty() {
+            widths[4] = widths[4].max(estimate_text_width("—"));
+            widths[5] = widths[5].max(estimate_text_width("—"));
+        }
+        for (alias, normalized_alias) in &group.aliases {
+            widths[4] = widths[4].max(estimate_text_width(alias));
+            widths[5] = widths[5].max(estimate_text_width(normalized_alias));
+        }
+    }
+    widths.map(|width| width.clamp(FONT_COL_MIN, FONT_COL_MAX))
+}
+
+fn sidebar_width(pinned: bool, hovered: bool) -> f32 {
+    if pinned || hovered { 210. } else { 48. }
 }
 
 fn main() {
@@ -3395,7 +4168,87 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::missing_chars_range;
+    use super::{font_row_matches, group_font_rows, missing_chars_range, sidebar_width};
+
+    #[test]
+    fn font_row_matches_path_names_aliases_and_weight() {
+        let row = assfonts::db::FontIndexRow {
+            path: "D:\\fonts\\Reed.ttf".to_string(),
+            face_index: 0,
+            display_name: "Reed".to_string(),
+            normalized_name: "reed".to_string(),
+            inferred_weight: 500,
+            aliases: vec![assfonts::db::FontIndexAlias {
+                alias: "Reed Bold".to_string(),
+                normalized_alias: "reedbold".to_string(),
+            }],
+        };
+        assert!(font_row_matches(&row, ""));
+        assert!(font_row_matches(&row, "reed"));
+        assert!(font_row_matches(&row, "bold"));
+        assert!(font_row_matches(&row, "500"));
+        assert!(font_row_matches(&row, "fonts"));
+        assert!(!font_row_matches(&row, "missing"));
+    }
+
+    #[test]
+    fn group_font_rows_merges_same_path_and_keeps_alias_per_row() {
+        let row = |face_index: u32, display_name: &str, alias: &str| assfonts::db::FontIndexRow {
+            path: "D:\\\\fonts\\\\Reed.ttf".to_string(),
+            face_index,
+            display_name: display_name.to_string(),
+            normalized_name: display_name.to_lowercase(),
+            inferred_weight: 500,
+            aliases: vec![assfonts::db::FontIndexAlias {
+                alias: alias.to_string(),
+                normalized_alias: alias.to_lowercase().replace(' ', ""),
+            }],
+        };
+        let rows = vec![
+            row(0, "Reed", "Reed"),
+            row(0, "Reed", "Reed Bold"),
+            row(1, "Reed Italic", "Reed Italic"),
+        ];
+        let groups = group_font_rows(&rows, "", usize::MAX);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].aliases.len(), 3);
+        assert_eq!(groups[0].aliases[1].0, "Reed Bold");
+
+        let limited = group_font_rows(&rows, "", 1);
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn group_font_rows_filters_by_query_and_limit_counts_fonts() {
+        let row = |path: &str, alias: &str| assfonts::db::FontIndexRow {
+            path: path.to_string(),
+            face_index: 0,
+            display_name: path.to_string(),
+            normalized_name: path.to_lowercase(),
+            inferred_weight: 400,
+            aliases: vec![assfonts::db::FontIndexAlias {
+                alias: alias.to_string(),
+                normalized_alias: alias.to_lowercase(),
+            }],
+        };
+        let rows = vec![row("A.ttf", "Alpha"), row("B.ttf", "Beta")];
+        let matched = group_font_rows(&rows, "beta", usize::MAX);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].row.path, "B.ttf");
+
+        // limit 按字体组截断，而不是按 alias 行数。
+        let limited = group_font_rows(&rows, "", 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].row.path, "A.ttf");
+    }
+
+    #[test]
+    fn sidebar_width_expands_when_pinned_or_hovered() {
+        assert_eq!(sidebar_width(true, false), 210.);
+        assert_eq!(sidebar_width(true, true), 210.);
+        assert_eq!(sidebar_width(false, true), 210.);
+        assert_eq!(sidebar_width(false, false), 48.);
+    }
 
     #[test]
     fn missing_chars_range_marks_only_the_character_list() {

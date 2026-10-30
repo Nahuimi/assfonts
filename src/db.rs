@@ -34,6 +34,79 @@ pub fn open_and_prepare_db(dbpath: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// One font row as shown in the GUI font table: one entry per
+/// `(path, face_index)`, with all of that face's aliases merged into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontIndexRow {
+    pub path: String,
+    pub face_index: u32,
+    pub display_name: String,
+    pub normalized_name: String,
+    pub inferred_weight: i32,
+    pub aliases: Vec<FontIndexAlias>,
+}
+
+/// One `(alias, normalized_alias)` pair belonging to a [`FontIndexRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontIndexAlias {
+    pub alias: String,
+    pub normalized_alias: String,
+}
+
+/// Read every font and its aliases from an already open database connection.
+pub(crate) fn read_font_index(conn: &Connection) -> Result<Vec<FontIndexRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.face_index, f.display_name, f.normalized_name, f.inferred_weight,
+                a.alias, a.normalized_alias
+         FROM fonts f
+         LEFT JOIN aliases a ON a.path = f.path AND a.face_index = f.face_index
+         ORDER BY f.path COLLATE NOCASE, f.face_index, a.alias COLLATE NOCASE",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out: Vec<FontIndexRow> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let face_index = u32::try_from(row.get::<_, i64>(1)?).unwrap_or(0);
+        let same_face = out
+            .last()
+            .is_some_and(|last| last.path == path && last.face_index == face_index);
+        if !same_face {
+            out.push(FontIndexRow {
+                path: path.clone(),
+                face_index,
+                display_name: row.get(2)?,
+                normalized_name: row.get(3)?,
+                inferred_weight: row.get(4)?,
+                aliases: Vec::new(),
+            });
+        }
+        let alias: Option<String> = row.get(5)?;
+        let normalized_alias: Option<String> = row.get(6)?;
+        if let (Some(alias), Some(normalized_alias)) = (alias, normalized_alias)
+            && let Some(last) = out.last_mut()
+        {
+            last.aliases.push(FontIndexAlias {
+                alias,
+                normalized_alias,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Read every font (and its aliases) from the `fonts.db` inside `dbpath`.
+///
+/// A missing database or one written by an older schema yields an empty list
+/// instead of an error: the GUI shows that as "index not built yet".
+pub fn load_font_index(dbpath: &Path) -> Result<Vec<FontIndexRow>> {
+    let db_file = dbpath.join("fonts.db");
+    if !db_file.exists() || !check_schema_version(&db_file)? {
+        return Ok(Vec::new());
+    }
+    let conn = open_connection(&db_file)?;
+    read_font_index(&conn)
+}
+
 fn check_schema_version(db_file: &Path) -> std::result::Result<bool, rusqlite::Error> {
     let conn = open_connection(db_file)?;
 
@@ -123,6 +196,67 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+
+    fn insert_font(conn: &Connection, path: &str, face: u32, display: &str, normalized: &str) {
+        conn.execute(
+            "INSERT INTO fonts (path, face_index, display_name, normalized_name, inferred_weight, is_italic, mtime, file_size)
+             VALUES (?1, ?2, ?3, ?4, 400, 0, 100, 100)",
+            rusqlite::params![path, face, display, normalized],
+        )
+        .expect("font insert");
+    }
+
+    fn insert_alias(conn: &Connection, path: &str, face: u32, alias: &str) {
+        conn.execute(
+            "INSERT INTO aliases (path, face_index, alias, normalized_alias)
+             VALUES (?1, ?2, ?3, ?3)",
+            rusqlite::params![path, face, alias],
+        )
+        .expect("alias insert");
+    }
+
+    #[test]
+    fn read_font_index_merges_aliases_into_one_row_per_face() -> Result<()> {
+        let mut conn = Connection::open_in_memory()?;
+        create_tables(&mut conn)?;
+        insert_font(&conn, "C:/fonts/a.ttc", 0, "Alpha", "alpha");
+        insert_font(&conn, "C:/fonts/a.ttc", 1, "Beta", "beta");
+        insert_font(&conn, "C:/fonts/b.otf", 0, "Gamma", "gamma");
+        insert_alias(&conn, "C:/fonts/a.ttc", 0, "Alpha Alias");
+        insert_alias(&conn, "C:/fonts/a.ttc", 0, "Second Alias");
+
+        let rows = read_font_index(&conn)?;
+        assert_eq!(rows.len(), 3, "one row per (path, face_index)");
+        assert_eq!(rows[0].path, "C:/fonts/a.ttc");
+        assert_eq!(rows[0].face_index, 0);
+        assert_eq!(rows[0].display_name, "Alpha");
+        assert_eq!(
+            rows[0].aliases,
+            vec![
+                FontIndexAlias {
+                    alias: "Alpha Alias".to_string(),
+                    normalized_alias: "Alpha Alias".to_string(),
+                },
+                FontIndexAlias {
+                    alias: "Second Alias".to_string(),
+                    normalized_alias: "Second Alias".to_string(),
+                },
+            ],
+            "aliases of the same face are merged into the row"
+        );
+        assert_eq!(rows[1].face_index, 1);
+        assert!(rows[1].aliases.is_empty());
+        assert_eq!(rows[2].display_name, "Gamma");
+        assert!(rows[2].aliases.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn load_font_index_returns_empty_for_a_missing_database() -> Result<()> {
+        let rows = load_font_index(Path::new("assfonts-missing-fonts-db-dir"))?;
+        assert!(rows.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn test_foreign_key_cascade() -> std::result::Result<(), Box<dyn std::error::Error>> {
