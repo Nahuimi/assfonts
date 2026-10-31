@@ -41,8 +41,9 @@ use gpui_kit::{
         ActiveTheme, TitleBar,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
-        menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+        menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
         scroll::{Scrollbar, ScrollbarMode},
+        select::{Select, SelectEvent, SelectState},
         switch::Switch,
         theme::{Theme, ThemeMode},
         *,
@@ -187,9 +188,9 @@ const FORMATS: [&str; 3] = ["ass/ssa 内嵌字体", "mks 独立字幕", "mkv 封
 const THEME_CHOICES: [&str; 3] = ["自动", "亮色", "暗色"];
 /// 字体页表格每页最多显示多少个字体；选择框在 100/300/500/1000 之间切换。
 const FONT_LIMITS: [usize; 4] = [100, 300, 500, 1000];
-/// 「显示前 N 条」触发按钮与弹出菜单共用的宽度。
-/// 菜单沿用触发按钮的宽度，左右边缘才和按钮对齐（下拉选择器的常规形态），
-/// 而不是按菜单项内容自行撑宽、只让左边贴住按钮。
+/// 「显示前 N 条」下拉选择器的宽度。
+/// 100/300/500/1000 切换时宽度不变，后面的搜索框才不会左右跳动；菜单宽度
+/// 默认跟随触发框（`Select` 的 `menu_width` 是 `Length::Auto`），左右边缘自然对齐。
 const FONT_LIMIT_SELECT_W: f32 = 100.;
 /// 字体表六列的标题。
 const FONT_COLUMNS: [&str; 6] = [
@@ -319,7 +320,9 @@ struct AssfontsApp {
     /// 需要重新读取 fonts.db（换页、改 dbpath、重建索引完成后置位）。
     font_rows_dirty: bool,
     font_search_input: Entity<InputState>,
-    /// `FONT_LIMITS` 的下标。
+    /// 「显示前 N 条」下拉选择器；选中项变化时同步下面的下标。
+    font_limit_select: Entity<SelectState<Vec<String>>>,
+    /// `FONT_LIMITS` 的下标（与 `font_limit_select` 的当前值保持一致）。
     font_limit_index: usize,
     font_scroll_x: ScrollHandle,
     font_scroll_y: ScrollHandle,
@@ -594,6 +597,16 @@ impl AssfontsApp {
         let muxer_path_input = make_input("封装器可执行文件路径，留空用 PATH");
         let ffprobe_path_input = make_input("ffprobe 路径（仅 ffmpeg 需要），留空用 PATH");
 
+        // 「显示前 N 条」：用组件的下拉选择器（带边框的触发框，和右侧搜索框同一家族）。
+        // 菜单宽度由组件按触发框宽度自适应，不需要手动对齐。
+        let font_limit_select = cx.new(|cx| {
+            let items: Vec<String> = FONT_LIMITS
+                .iter()
+                .map(|count| format!("{count} 条"))
+                .collect();
+            SelectState::new(items, Some(IndexPath::new(0)), window, cx)
+        });
+
         // 处理页的字体目录只在本次运行有效，不从 gui.toml 恢复。
         apply_input(&dbpath_input, &settings.dbpath, window, cx);
         apply_input(&output_input, &settings.output, window, cx);
@@ -625,6 +638,22 @@ impl AssfontsApp {
             |this: &mut Self, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.font_rows_dirty = true;
+                    cx.notify();
+                }
+            },
+        ));
+        // 「显示前 N 条」：确认选择后把「100 条」这类标题解析回 FONT_LIMITS 下标。
+        input_subs.push(cx.subscribe(
+            &font_limit_select,
+            |this: &mut Self, _select, event: &SelectEvent<Vec<String>>, cx| {
+                let SelectEvent::Confirm(value) = event;
+                let index = value
+                    .as_deref()
+                    .and_then(|title| title.split_whitespace().next())
+                    .and_then(|digits| digits.parse::<usize>().ok())
+                    .and_then(|count| FONT_LIMITS.iter().position(|&limit| limit == count));
+                if let Some(index) = index {
+                    this.font_limit_index = index;
                     cx.notify();
                 }
             },
@@ -690,6 +719,7 @@ impl AssfontsApp {
             font_rows_state: FontRowsState::Idle,
             font_rows_dirty: false,
             font_search_input,
+            font_limit_select,
             font_limit_index: 0,
             font_scroll_x: ScrollHandle::default(),
             font_scroll_y: ScrollHandle::default(),
@@ -2716,49 +2746,19 @@ impl AssfontsApp {
                     ),
             );
 
-        let limit_entity = entity.clone();
-        let current_limit_index = self.font_limit_index % FONT_LIMITS.len();
-        let limit_label = format!("{limit} 条");
         let toolbar = h_flex()
             .flex_none()
             .items_center()
             .gap_2()
             .child(div().text_size(px(12.)).text_color(muted).child("显示前"))
             .child(
-                Button::new("font-limit")
-                    .ghost()
-                    // 固定宽度，切换 100/300/500/1000 时按钮与后面的搜索框不会左右跳动；
-                    // 高度用默认中等尺寸（h_8），与搜索框对齐。
-                    .w(px(FONT_LIMIT_SELECT_W))
-                    .label(limit_label)
-                    .dropdown_caret(true)
-                    // 菜单右下角贴住按钮右下角，配合菜单同宽，左右边缘都对齐。
-                    .dropdown_menu_with_anchor(
-                        Anchor::TopRight,
-                        move |menu: PopupMenu,
-                              _window: &mut Window,
-                              _cx: &mut Context<PopupMenu>| {
-                            // 菜单默认按内容/最小宽度撑开，会比按钮宽出一截；
-                            // 这里锁定成按钮宽度，左右边缘与触发按钮对齐。
-                            let mut menu = menu
-                                .min_w(px(FONT_LIMIT_SELECT_W))
-                                .max_w(px(FONT_LIMIT_SELECT_W));
-                            for (index, count) in FONT_LIMITS.iter().enumerate() {
-                                let item_entity = limit_entity.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(format!("{count} 条"))
-                                        .checked(index == current_limit_index)
-                                        .on_click(move |_, _, cx| {
-                                            item_entity.update(cx, |this, cx| {
-                                                this.font_limit_index = index;
-                                                cx.notify();
-                                            });
-                                        }),
-                                );
-                            }
-                            menu
-                        },
-                    ),
+                // 下拉选择器：触发框带边框，和右侧搜索框同高同族；菜单宽度默认跟随
+                // 触发框（`Length::Auto`），展开后左右边缘都和触发框对齐。
+                div().w(px(FONT_LIMIT_SELECT_W)).child(
+                    Select::new(&self.font_limit_select)
+                        .id("font-limit")
+                        .accessibility_label("显示前字体条数"),
+                ),
             )
             .child(
                 div()
