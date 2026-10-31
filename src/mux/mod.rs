@@ -24,6 +24,23 @@ impl MuxerKind {
     }
 }
 
+/// Build a subprocess command for an external muxer.
+///
+/// On Windows the GUI binary has no console of its own, so every child that
+/// inherits a console flashes a window; `CREATE_NO_WINDOW` suppresses that
+/// without affecting CLI users (they have a console already).
+pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` from the Windows process creation flags.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 pub trait Muxer {
     fn kind(&self) -> MuxerKind;
     /// Run the mux. `scratch_dir` receives intermediate files (option file)

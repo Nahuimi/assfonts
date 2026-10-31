@@ -134,6 +134,13 @@ type ResolvedFontKey = (PathBuf, u32);
 pub trait ProgressReporter: Send + Sync {
     /// Human-readable progress line.
     fn report(&self, message: String);
+    /// Structured progress for the GUI progress card.
+    ///
+    /// `stage` names the step being worked on (shown above the bar) and
+    /// `done`/`total` are item counts. `total == 0` means the total is not
+    /// known yet, so the GUI shows an indeterminate bar. Reporters that only
+    /// keep the log (CLI, tests) can rely on the no-op default.
+    fn progress(&self, _stage: &str, _done: usize, _total: usize) {}
     /// Return true to abort the run at the next checkpoint.
     fn cancelled(&self) -> bool;
 }
@@ -163,6 +170,7 @@ struct FontProcessContext<'a> {
 
 pub fn run_build(options: BuildOptions, reporter: &dyn ProgressReporter) -> Result<()> {
     reporter.report("扫描字体目录…".to_string());
+    reporter.progress("扫描字体目录", 0, 0);
     validate_fontpaths(&options.fontpaths)?;
 
     fs::create_dir_all(&options.output)?;
@@ -195,6 +203,8 @@ pub fn run_build(options: BuildOptions, reporter: &dyn ProgressReporter) -> Resu
     }
 
     let tx = conn.transaction()?;
+    let font_total = found_files.len();
+    reporter.progress("写入字体索引", 0, font_total);
     {
         let mut stmt_check =
             tx.prepare("SELECT mtime, file_size FROM fonts WHERE path = ?1 LIMIT 1")?;
@@ -210,7 +220,8 @@ pub fn run_build(options: BuildOptions, reporter: &dyn ProgressReporter) -> Resu
 
         let mut current_valid_paths = std::collections::HashSet::new();
 
-        for (raw_path, abs_path, size, mtime) in found_files {
+        for (index, (raw_path, abs_path, size, mtime)) in found_files.into_iter().enumerate() {
+            reporter.progress("写入字体索引", index, font_total);
             let abs_path_str = abs_path.to_string_lossy().to_string();
             current_valid_paths.insert(abs_path_str.clone());
 
@@ -273,12 +284,13 @@ pub fn run_build(options: BuildOptions, reporter: &dyn ProgressReporter) -> Resu
         }
     }
     tx.commit()?;
+    reporter.progress("写入字体索引", font_total, font_total);
     Ok(())
 }
 
 pub fn run_process(options: RunOptions, reporter: &dyn ProgressReporter) -> Result<()> {
-    if options.videos.is_some() && options.format != OutputFormat::Mkv {
-        bail!("--video is only valid with --format mkv");
+    if options.videos.is_some() && options.format == OutputFormat::Embed {
+        bail!("--video is only valid with --format mks or --format mkv");
     }
 
     match options.format {
@@ -315,7 +327,9 @@ pub fn check_subtitles(
     let mut loaded: Vec<(PathBuf, String)> = Vec::new();
     let mut requested_names: HashSet<String> = HashSet::new();
     let mut requests_all: BTreeSet<String> = BTreeSet::new();
-    for (input, _) in &ass_files {
+    let read_total = ass_files.len();
+    for (index, (input, _)) in ass_files.iter().enumerate() {
+        reporter.progress("读取字幕", index, read_total);
         if reporter.cancelled() {
             bail!(AssfontsError::Cancelled);
         }
@@ -368,6 +382,7 @@ pub fn check_subtitles(
             total,
             input.display()
         ));
+        reporter.progress("检查字形", index, total);
 
         let analysis = analyze_ass(content);
         if analysis.font_requests.is_empty() {
@@ -571,6 +586,7 @@ fn run_process_embed(options: RunOptions, reporter: &dyn ProgressReporter) -> Re
                 total,
                 input.display()
             ));
+            reporter.progress("处理字幕", index + 1, total);
             process_single_input(
                 input,
                 base_dir,
@@ -711,27 +727,50 @@ fn run_process_mux(options: RunOptions, reporter: &dyn ProgressReporter) -> Resu
         bail!("no ASS/SSA subtitle files found in the given inputs");
     }
 
+    // mks 和 mkv 都按媒体文件分组：一个视频 + 多条字幕 → 一个输出文件
+    // （mks 只是不把视频轨封进去，文件名同样用视频名）。没有视频输入时，
+    // 每条字幕各自成一个输出。
     let groups: Vec<(Option<PathBuf>, Vec<PathBuf>)> = match options.format {
-        OutputFormat::Mks => sub_files.iter().map(|s| (None, vec![s.clone()])).collect(),
-        OutputFormat::Mkv => {
-            let Some(video_inputs) = &options.videos else {
-                bail!("--format mkv requires --video");
+        OutputFormat::Mks | OutputFormat::Mkv => {
+            let videos = match &options.videos {
+                Some(video_inputs) => collect_media_files(video_inputs)?,
+                None if options.format == OutputFormat::Mkv => {
+                    bail!("--format mkv requires --video");
+                }
+                None => Vec::new(),
             };
-            let videos = collect_media_files(video_inputs)?;
             if videos.is_empty() {
-                bail!("no media files found in --video inputs");
+                if options.format == OutputFormat::Mkv {
+                    bail!("no media files found in --video inputs");
+                }
+                sub_files.iter().map(|s| (None, vec![s.clone()])).collect()
+            } else {
+                let (mut matched, mut unmatched) =
+                    mux::job::match_media_groups(&videos, &sub_files);
+                if matched.is_empty() {
+                    // 字幕名和媒体名对不上时（例如 `01.chs_jpn.ass` 配
+                    // `[组名] 标题 [01][...].mkv`），退回 SubRenamer 式按顺序配对。
+                    let (by_order, order_unmatched) =
+                        mux::job::match_media_groups_by_order(&videos, &sub_files);
+                    matched = by_order;
+                    unmatched = order_unmatched;
+                }
+                for sub in &unmatched {
+                    reporter.report(format!("警告：字幕 \"{}\" 没有配到媒体文件", sub.display()));
+                }
+                if matched.is_empty() {
+                    bail!("no subtitle matched any media file by name");
+                }
+                let mut groups: Vec<(Option<PathBuf>, Vec<PathBuf>)> = matched
+                    .into_iter()
+                    .map(|(video, subs)| (Some(video), subs))
+                    .collect();
+                if options.format == OutputFormat::Mks {
+                    // mks 不丢弃任何字幕：没配到视频的各自封一个文件。
+                    groups.extend(unmatched.into_iter().map(|sub| (None, vec![sub])));
+                }
+                groups
             }
-            let (matched, unmatched) = mux::job::match_media_groups(&videos, &sub_files);
-            for sub in &unmatched {
-                eprintln!("warning: no media matched subtitle \"{}\"", sub.display());
-            }
-            if matched.is_empty() {
-                bail!("no subtitle matched any media file by name");
-            }
-            matched
-                .into_iter()
-                .map(|(video, subs)| (Some(video), subs))
-                .collect()
         }
         OutputFormat::Embed => unreachable!("embed output is handled by run_process_embed"),
     };
@@ -739,7 +778,10 @@ fn run_process_mux(options: RunOptions, reporter: &dyn ProgressReporter) -> Resu
     let mut requested_font_names = HashSet::new();
     let mut analyses: HashMap<PathBuf, AssAnalysis> = HashMap::new();
     let mut loaded_contents: Vec<String> = Vec::new();
-    for sub in &sub_files {
+    let analysis_total = sub_files.len();
+    reporter.progress("分析字幕", 0, analysis_total);
+    for (index, sub) in sub_files.iter().enumerate() {
+        reporter.progress("分析字幕", index, analysis_total);
         let content = load_and_preprocess_ass(sub)?;
         let analysis = analyze_ass(&content);
         for request in analysis.font_requests.keys() {
@@ -768,7 +810,9 @@ fn run_process_mux(options: RunOptions, reporter: &dyn ProgressReporter) -> Resu
         .unwrap_or_default();
 
     let mut reports: Vec<RunReport> = Vec::new();
-    for (media, subs) in &groups {
+    let group_total = groups.len();
+    for (index, (media, subs)) in groups.iter().enumerate() {
+        reporter.progress("封装", index, group_total);
         if reporter.cancelled() {
             bail!(AssfontsError::Cancelled);
         }
@@ -954,7 +998,10 @@ fn mux_group(
             .and_then(|m| m.file_stem())
             .and_then(|s| s.to_str())
         {
-            Some(media_stem) => mux::job::subtitle_comment(&sub_stem, media_stem),
+            // 顺序配对时字幕名往往不带视频名前缀，此时退回字幕自身的注释，
+            // 轨道命名（字幕组/语言后缀）才不会整段失效。
+            Some(media_stem) => mux::job::subtitle_comment(&sub_stem, media_stem)
+                .or_else(|| mux::job::standalone_comment(&sub_stem)),
             None => mux::job::standalone_comment(&sub_stem),
         };
         let meta = mux::job::subtitle_track_meta(comment.as_deref(), &track_meta_options);
@@ -1038,15 +1085,16 @@ fn mux_group(
         });
     }
 
-    let output_name = match media {
-        Some(video) => {
-            let stem = video
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("output");
-            format!("{stem}.muxed.mkv")
-        }
-        None => format!("{group_stem}.mks"),
+    let media_stem = media.as_ref().and_then(|video| {
+        video
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    });
+    let output_name = match (options.format, &media_stem) {
+        (OutputFormat::Mkv, Some(stem)) => format!("{stem}.muxed.mkv"),
+        (_, Some(stem)) => format!("{stem}.mks"),
+        (_, None) => format!("{group_stem}.mks"),
     };
     let output = mux::job::resolve_output_path(options.output.join(output_name));
     let title = options.title.clone().or_else(|| {
@@ -1058,7 +1106,12 @@ fn mux_group(
     });
 
     let mut job = mux::MuxJob::new(output.clone());
-    job.media = media.clone();
+    // mks 只封装字幕轨：视频只用于分组和命名，不写进输出。
+    job.media = if options.format == OutputFormat::Mkv {
+        media.clone()
+    } else {
+        None
+    };
     job.subtitles = tracks;
     job.attachments = attachments;
     job.title = title;
@@ -1913,10 +1966,18 @@ mod tests {
 
         struct RecordingReporter {
             messages: Mutex<Vec<String>>,
+            progress: Mutex<Vec<(String, usize, usize)>>,
         }
         impl super::ProgressReporter for RecordingReporter {
             fn report(&self, message: String) {
                 self.messages.lock().unwrap().push(message);
+            }
+
+            fn progress(&self, stage: &str, done: usize, total: usize) {
+                self.progress
+                    .lock()
+                    .unwrap()
+                    .push((stage.to_string(), done, total));
             }
 
             fn cancelled(&self) -> bool {
@@ -1940,6 +2001,7 @@ mod tests {
         let inputs = vec![PathBuf::from("examples/sample.ass")];
         let reporter = RecordingReporter {
             messages: Mutex::new(Vec::new()),
+            progress: Mutex::new(Vec::new()),
         };
         let summary = super::check_subtitles(&inputs, &options, &reporter).unwrap();
 
@@ -1959,6 +2021,21 @@ mod tests {
         assert!(messages.iter().any(|line| line.contains("缺少字体")));
         assert!(messages.iter().any(|line| line.contains("检查汇总")));
         drop(messages);
+
+        // The GUI progress card is driven by these stages, so a check run has
+        // to report them with a known total.
+        let progress = reporter.progress.lock().unwrap();
+        assert!(
+            progress
+                .iter()
+                .any(|(stage, done, total)| stage == "读取字幕" && *done == 0 && *total == 1)
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|(stage, _done, total)| stage == "检查字形" && *total == 1)
+        );
+        drop(progress);
 
         // A check run must not create the output directory or any file.
         assert!(!output.exists());

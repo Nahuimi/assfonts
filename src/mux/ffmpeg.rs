@@ -1,6 +1,6 @@
-use std::{path::Path, process::Command};
+use std::path::Path;
 
-use super::{MuxResult, job::MuxJob};
+use super::{MuxResult, command, job::MuxJob};
 use crate::error::{AssfontsError, Result};
 
 pub struct FfmpegMuxer {
@@ -24,7 +24,7 @@ pub struct ProbeInfo {
 
 /// Probe the input media with ffprobe to count original streams per type.
 pub fn probe_media(ffprobe: &str, media: &Path) -> Result<ProbeInfo> {
-    let run = Command::new(ffprobe)
+    let run = command(ffprobe)
         .args(["-v", "0", "-print_format", "json", "-show_streams"])
         .arg(media)
         .output()
@@ -53,6 +53,84 @@ pub fn probe_media(ffprobe: &str, media: &Path) -> Result<ProbeInfo> {
         }
     }
     Ok(info)
+}
+
+/// Number of original subtitle tracks kept ahead of ours in the output.
+///
+/// ffmpeg's `-metadata:s:s:N` and `-disposition:s:N` both count output
+/// subtitle streams, so kept originals shift every index we write.
+fn subtitle_meta_base(job: &MuxJob, probe: Option<&ProbeInfo>) -> usize {
+    if job.media.is_some() && job.keep_subs {
+        probe.map_or(0, |info| info.subtitles)
+    } else {
+        0
+    }
+}
+
+/// Subtitle tracks whose language tag ffmpeg cannot represent faithfully.
+///
+/// ffmpeg writes the raw string into Matroska's legacy `Language` element,
+/// and readers reduce it to the bare sub-tag (`zh-Hans` shows up as `zh`).
+/// Tags without a script/region part are already valid ISO 639-2 codes and
+/// need no post pass.
+///
+/// The returned ordinal is 1-based, matching `mkvpropedit`'s `track:s<N>`.
+fn ietf_language_edits(job: &MuxJob, probe: Option<&ProbeInfo>) -> Vec<(usize, String)> {
+    let base = subtitle_meta_base(job, probe);
+    job.subtitles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| {
+            let language = track.language.as_deref()?;
+            language
+                .contains('-')
+                .then(|| (base + index + 1, language.to_string()))
+        })
+        .collect()
+}
+
+/// Arguments for rewriting BCP-47 language tags with `mkvpropedit`.
+///
+/// `mkvpropedit --set language=zh-Hans` behaves like `mkvmerge --language`:
+/// it stores `Language=chi` together with `LanguageIETF=zh-Hans`, which is
+/// exactly the pair the mkvmerge adapter produces.
+fn propedit_args(output: &Path, edits: &[(usize, String)]) -> Vec<String> {
+    let mut args = vec![output.to_string_lossy().to_string()];
+    for (ordinal, language) in edits {
+        args.extend([
+            "--edit".to_string(),
+            format!("track:s{ordinal}"),
+            "--set".to_string(),
+            format!("language={language}"),
+        ]);
+    }
+    args
+}
+
+/// Rewrite the BCP-47 language tags ffmpeg could not express, returning a
+/// note for the mux log. A missing or failing `mkvpropedit` only degrades
+/// the language granularity — the muxed file itself is still valid, so this
+/// must never fail the mux.
+fn apply_ietf_languages(output: &Path, edits: &[(usize, String)]) -> String {
+    let Some(propedit) = super::find_on_path("mkvpropedit") else {
+        let tags: Vec<&str> = edits.iter().map(|(_, tag)| tag.as_str()).collect();
+        return format!(
+            "\n提示：未找到 mkvpropedit，语言标签（{}）只能按 ffmpeg 的写法保留。\n",
+            tags.join(", ")
+        );
+    };
+
+    let run = command(propedit)
+        .args(propedit_args(output, edits))
+        .output();
+    match run {
+        Ok(run) if run.status.success() => String::new(),
+        Ok(run) => format!(
+            "\n警告：mkvpropedit 未能写入 BCP-47 语言标签：{}\n",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ),
+        Err(err) => format!("\n警告：mkvpropedit 运行失败：{err}\n"),
+    }
 }
 
 fn attachment_mime(path: &Path) -> &'static str {
@@ -93,7 +171,7 @@ pub fn build_args(job: &MuxJob, probe: Option<&ProbeInfo>) -> Vec<String> {
     }
 
     let mut first_sub_input = 0usize;
-    let mut sub_meta_base = 0usize;
+    let sub_meta_base = subtitle_meta_base(job, probe);
     let mut sub_absolute_base = 0usize;
     let mut attachment_base = 0usize;
 
@@ -114,7 +192,6 @@ pub fn build_args(job: &MuxJob, probe: Option<&ProbeInfo>) -> Vec<String> {
         }
         if job.keep_subs {
             args.extend(["-map", "0:s?"].map(String::from));
-            sub_meta_base = count(|info| info.subtitles);
             sub_absolute_base += sub_meta_base;
         }
     }
@@ -180,7 +257,7 @@ impl super::Muxer for FfmpegMuxer {
             None => None,
         };
 
-        let run = Command::new(&self.program)
+        let run = command(&self.program)
             .args(build_args(job, probe.as_ref()))
             .output()
             .map_err(|err| AssfontsError::Mux(format!("failed to spawn ffmpeg: {err}")))?;
@@ -199,6 +276,14 @@ impl super::Muxer for FfmpegMuxer {
             )));
         }
 
+        // ffmpeg cannot write Matroska's `LanguageIETF`; rewrite those tags
+        // afterwards so the output matches the mkvmerge adapter.
+        let edits = ietf_language_edits(job, probe.as_ref());
+        let mut log = log;
+        if !edits.is_empty() {
+            log.push_str(&apply_ietf_languages(&job.output, &edits));
+        }
+
         Ok(MuxResult {
             output: job.output.clone(),
             exit_code,
@@ -209,9 +294,9 @@ impl super::Muxer for FfmpegMuxer {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::{ProbeInfo, build_args};
+    use super::{ProbeInfo, build_args, ietf_language_edits, propedit_args};
     use crate::mux::{MuxJob, SubTrack};
 
     #[test]
@@ -342,5 +427,86 @@ mod tests {
         assert!(args.contains(&"-disposition:s:6".to_string()));
         // attachment metadata is relative to attachment streams: after 1 original
         assert!(args.contains(&"-metadata:s:t:1".to_string()));
+    }
+
+    #[test]
+    fn ietf_languages_get_a_post_pass_only_when_needed() {
+        let mut job = MuxJob::new(PathBuf::from("out/show.mks"));
+        job.subtitles = vec![
+            SubTrack {
+                path: PathBuf::from("a.ass"),
+                title: None,
+                language: Some("zh-Hans".to_string()),
+                is_default: true,
+            },
+            SubTrack {
+                path: PathBuf::from("b.ass"),
+                title: None,
+                language: Some("chi".to_string()),
+                is_default: false,
+            },
+            SubTrack {
+                path: PathBuf::from("c.ass"),
+                title: None,
+                language: Some("zh-Hant".to_string()),
+                is_default: false,
+            },
+            SubTrack {
+                path: PathBuf::from("d.ass"),
+                title: None,
+                language: None,
+                is_default: false,
+            },
+        ];
+
+        assert_eq!(
+            ietf_language_edits(&job, None),
+            vec![(1, "zh-Hans".to_string()), (3, "zh-Hant".to_string())]
+        );
+    }
+
+    #[test]
+    fn ietf_post_pass_counts_kept_subtitle_tracks() {
+        let mut job = MuxJob::new(PathBuf::from("out/show.muxed.mkv"));
+        job.media = Some(PathBuf::from("in/show.mkv"));
+        job.keep_subs = true;
+        job.subtitles = vec![SubTrack {
+            path: PathBuf::from("a.ass"),
+            title: None,
+            language: Some("zh-Hans".to_string()),
+            is_default: true,
+        }];
+        let probe = ProbeInfo {
+            videos: 1,
+            audios: 1,
+            attachments: 0,
+            subtitles: 2,
+        };
+
+        assert_eq!(
+            ietf_language_edits(&job, Some(&probe)),
+            vec![(3, "zh-Hans".to_string())]
+        );
+    }
+
+    #[test]
+    fn propedit_args_edit_each_subtitle_track() {
+        let edits = vec![(1, "zh-Hans".to_string()), (3, "zh-Hant".to_string())];
+        assert_eq!(
+            propedit_args(Path::new("out/show.mkv"), &edits),
+            [
+                "out/show.mkv",
+                "--edit",
+                "track:s1",
+                "--set",
+                "language=zh-Hans",
+                "--edit",
+                "track:s3",
+                "--set",
+                "language=zh-Hant",
+            ]
+            .map(String::from)
+            .to_vec()
+        );
     }
 }

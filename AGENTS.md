@@ -52,11 +52,11 @@
 | `--report` | `false` | Generate `run-report.json` after processing |
 | `--force` | `false` | Overwrite existing output files (embed mode) |
 | `--format` | `embed` | Output format: `embed`, `mks`, or `mkv` |
-| `--video` | (none) | Media files/directories for `--format mkv` |
+| `--video` | (none) | Media files/directories for `--format mks` or `--format mkv` |
 | `--muxer` | `mkvmerge` | External muxer for mks/mkv (`mkvmerge` or `ffmpeg`) |
 | `--language` | (none) | Subtitle language: fixed code or `.comment=code;...` mappings |
 | `--default-track` | (first) | Subtitle comment to mark as default track |
-| `--track-name-style` | `english` | mks/mkv track title style: `english` (`KTXP.TC`) or `chinese` (`极影字幕社.繁体`) |
+| `--track-name-style` | `english` | mks/mkv track title style: `english` (`KTXP-TC`) or `chinese` (`极影字幕社-繁体`) |
 | `--track-fansub-suffix` | `true` | Include the fansub-group suffix in track names |
 | `--track-language-suffix` | `true` | Include the language suffix in track names |
 | `--title` | (media name) | Override container title |
@@ -68,7 +68,7 @@
 | `--char-compatible` | `false` | Keep all ASCII letters (and all digits when any digit is used) in subsetted fonts |
 | `--keep-temp` | `false` | Keep the intermediate `.fonts/` directory after muxing |
 
-mks/mkv mode groups subtitles per media file by case-insensitive stem-prefix matching, shares subset fonts across the group, muxes fonts as Matroska attachments, and deletes the temporary `<output>.fonts/` directory on success (`--keep-temp` keeps it; failures also keep it). Mux outputs auto-dedup with `#1`, `#2`, … suffixes.
+mks/mkv mode groups subtitles per media file by case-insensitive stem-prefix matching (falling back to SubRenamer-style order pairing when no stem matches), shares subset fonts across the group, muxes fonts as Matroska attachments, and deletes the temporary `<output>.fonts/` directory on success (`--keep-temp` keeps it; failures also keep it). `mkv` writes `{video_stem}.muxed.mkv` with the media track; `mks` writes `{video_stem}.mks` from the same grouping but leaves the video track out (subtitles that paired with no media become their own `.mks`). Mux outputs auto-dedup with `#1`, `#2`, … suffixes.
 
 ### build Subcommand (BuildOptions)
 
@@ -121,7 +121,7 @@ Given `-o ./out` and input `sample.ass`:
 - `rayon` — parallel processing
 - `dashmap` — concurrent hash map for font byte caching
 
-External tools (mks/mkv mode only): `mkvmerge` (primary) or `ffmpeg` + `ffprobe` (fallback), probed at runtime.
+External tools (mks/mkv mode only): `mkvmerge` (primary) or `ffmpeg` + `ffprobe` (fallback), probed at runtime. The ffmpeg path also uses `mkvpropedit` (shipped with MKVToolNix) to rewrite BCP-47 subtitle language tags: ffmpeg cannot emit Matroska `LanguageIETF`, so `zh-Hans` would otherwise be stored as a raw legacy `Language` value that readers collapse to `zh`; when `mkvpropedit` is missing the tag degrades to ffmpeg's raw write and the mux still succeeds.
 
 ## Pitfalls
 

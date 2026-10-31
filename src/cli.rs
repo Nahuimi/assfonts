@@ -118,7 +118,7 @@ pub struct RunOptions {
         long = "video",
         num_args = 1..,
         value_name = "PATH",
-        help = "Media files or directories for --format mkv"
+        help = "Media files or directories for --format mks or --format mkv"
     )]
     pub videos: Option<Vec<PathBuf>>,
 
@@ -149,7 +149,7 @@ pub struct RunOptions {
         value_enum,
         default_value_t = crate::mux::job::TrackNameStyle::English,
         value_name = "STYLE",
-        help = "mks/mkv track names: english (KTXP.TC) or chinese (极影字幕社.繁体)"
+        help = "mks/mkv track names: english (KTXP-TC) or chinese (极影字幕社-繁体)"
     )]
     pub track_name_style: crate::mux::job::TrackNameStyle,
 

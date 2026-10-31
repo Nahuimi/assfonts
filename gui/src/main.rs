@@ -11,6 +11,7 @@
 #![windows_subsystem = "windows"]
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -38,10 +39,12 @@ use gpui_kit::{
     ExternalPaths,
     assets::{AllAssets, IconName},
     component::{
-        ActiveTheme, TitleBar,
+        ActiveTheme, TitleBar, WindowExt,
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+        notification::Notification,
+        progress::Progress,
         scroll::{Scrollbar, ScrollbarMode},
         select::{Select, SelectEvent, SelectState},
         switch::Switch,
@@ -93,7 +96,7 @@ struct GuiSettings {
     /// 在最终文件名里插入语言后缀（`.SC`）。
     #[serde(default)]
     language_suffix: bool,
-    /// mks/mkv 字幕轨命名方式：英文（KTXP.TC）或中文（极影字幕社.繁体）。
+    /// mks/mkv 字幕轨命名方式：英文（KTXP-TC）或中文（极影字幕社-繁体）。
     #[serde(default = "default_track_name_style")]
     track_name_style: TrackNameStyle,
     /// 右键菜单「设为默认字幕」的归类键：该归类键的轨道在 mks/mkv 里标 default。
@@ -334,6 +337,12 @@ struct AssfontsApp {
     font_col_drag: Option<(usize, f32, f32)>,
     /// 重建索引正在跑；任务结束后自动刷新表格。
     rebuild_in_flight: bool,
+    /// 当前后台任务的进度（处理/重建索引/应用重命名共用；同一时间只跑一个）。
+    task_progress: Option<TaskProgress>,
+    /// 等下一次 render 时推给通知层的完成提示（只有 render 里拿得到 `Window`）。
+    pending_toast: Option<Notification>,
+    /// 上一次复制模式操作写出的文件；空表示没有可撤销的复制。
+    rename_undo: Vec<CopyRecord>,
     /// 保持输入框观察者的订阅存活（丢弃 Subscription 会取消订阅）。
     #[allow(dead_code)] // 只用于持有订阅，代码里不会读取
     input_subs: Vec<Subscription>,
@@ -341,16 +350,101 @@ struct AssfontsApp {
     tools_found: (bool, bool),
 }
 
+/// 后台任务发回界面的消息：日志行、结构化进度，以及重命名任务结束时带回的汇总。
+enum TaskMessage {
+    /// 一行日志。
+    Line(String),
+    /// 结构化进度：阶段名、已完成项数、总项数（`total == 0` 表示总数未知）。
+    Progress {
+        stage: String,
+        done: usize,
+        total: usize,
+    },
+    /// 重命名/复制任务结束时带回的汇总与可撤销记录（库层任务不发送）。
+    RenameFinished {
+        done: usize,
+        failed: usize,
+        undo: Vec<CopyRecord>,
+    },
+}
+
+/// 三页共用的进度卡状态。
+#[derive(Debug, Clone, PartialEq)]
+struct TaskProgress {
+    /// 任务标题，如「处理 3 个输入（mks 模式）」。
+    title: String,
+    /// 当前阶段，如「写入字体索引」。
+    stage: String,
+    /// 已完成项数。
+    done: usize,
+    /// 总项数；0 表示总数未知（进度条走不确定动画）。
+    total: usize,
+}
+
+impl TaskProgress {
+    /// 0-100 的百分比；总数未知时为 `None`（不确定进度）。
+    fn percent(&self) -> Option<f32> {
+        (self.total > 0).then(|| {
+            (self.done.min(self.total) as f32 / self.total as f32 * 100.0).clamp(0.0, 100.0)
+        })
+    }
+
+    /// 「12/300」计数文字；总数未知时为 `None`。
+    fn counters(&self) -> Option<String> {
+        (self.total > 0).then(|| format!("{}/{}", self.done.min(self.total), self.total))
+    }
+}
+
+/// 复制模式下写出的一份文件；撤销时用 size/mtime 确认它还是我们复制的那份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyRecord {
+    path: PathBuf,
+    size: u64,
+    mtime: i64,
+}
+
+impl CopyRecord {
+    /// 复制完成后记录目标文件的大小与 mtime。
+    fn of(path: PathBuf) -> Option<Self> {
+        let metadata = std::fs::metadata(&path).ok()?;
+        let mtime = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(Self {
+            path,
+            size: metadata.len(),
+            mtime,
+        })
+    }
+
+    /// 文件仍存在且大小/mtime 都没变（用户没改过、也没被替换）。
+    fn still_ours(&self) -> bool {
+        Self::of(self.path.clone())
+            .is_some_and(|now| now.size == self.size && now.mtime == self.mtime)
+    }
+}
+
 /// Forwards library progress lines into the GUI log channel and exposes
 /// the cancel flag to the library's checkpoints.
 struct ChannelReporter {
-    tx: smol::channel::Sender<String>,
+    tx: smol::channel::Sender<TaskMessage>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl ProgressReporter for ChannelReporter {
     fn report(&self, message: String) {
-        let _ = self.tx.send_blocking(message);
+        let _ = self.tx.send_blocking(TaskMessage::Line(message));
+    }
+
+    fn progress(&self, stage: &str, done: usize, total: usize) {
+        let _ = self.tx.send_blocking(TaskMessage::Progress {
+            stage: stage.to_string(),
+            done,
+            total,
+        });
     }
 
     fn cancelled(&self) -> bool {
@@ -391,6 +485,8 @@ fn display_name(path: &Path) -> String {
 struct ProcessRow {
     video: Option<PathBuf>,
     sub: PathBuf,
+    /// 只拖入视频、还没配对字幕时的占位行（不参与处理/检查）。
+    media_only: bool,
     /// 归类键（分类名小写，未命中则注释小写）。
     key: String,
     /// 生效的字幕组缩写/自定义文本（决定文件名后缀）。
@@ -406,6 +502,9 @@ struct ProcessRow {
 impl ProcessRow {
     /// embed 模式只能把字体写进 ASS，其他字幕格式不支持。
     fn supports_embed(&self) -> bool {
+        if self.media_only {
+            return false;
+        }
         matches!(
             self.sub
                 .extension()
@@ -571,6 +670,19 @@ fn subtitle_context_menu(
     )
 }
 
+/// 「应用重命名」前的复查结果。
+#[derive(Debug, Default)]
+struct RenameReview {
+    /// 可以执行的行：(源字幕, 目标路径)。
+    queued: Vec<(PathBuf, PathBuf)>,
+    /// 源文件已变化或消失、会跳过的行。
+    stale: Vec<PathBuf>,
+    /// 目标文件现在已存在（或与本批其他行重名）、会跳过的行。
+    conflicts: Vec<PathBuf>,
+    /// 复查过程中已占用的目标路径，用来发现批内重名。
+    claimed: BTreeSet<PathBuf>,
+}
+
 impl AssfontsApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = load_settings();
@@ -727,6 +839,9 @@ impl AssfontsApp {
             font_col_custom: false,
             font_col_drag: None,
             rebuild_in_flight: false,
+            task_progress: None,
+            pending_toast: None,
+            rename_undo: Vec::new(),
             input_subs,
             // PATH lookup only — no subprocess (a GUI parent would flash consoles).
             tools_found: (
@@ -859,13 +974,14 @@ impl AssfontsApp {
 
     fn collect_options(&self, cx: &App) -> Result<RunOptions, String> {
         let format = format_output_format(self.format_index);
-        if self.process_rows.is_empty() {
-            return Err("请把字幕文件（和 mkv 模式下的媒体文件）拖进表格".to_string());
+        // 只拖了视频的占位行不算输入。
+        let subtitle_rows = self.process_rows.iter().filter(|row| !row.media_only);
+        if subtitle_rows.clone().next().is_none() {
+            return Err("请把字幕文件拖进表格".to_string());
         }
         // embed 只能写 ASS/SSA；其它格式在表格里已标为不可用，这里再兜底过滤。
-        let inputs: Vec<PathBuf> = self
-            .process_rows
-            .iter()
+        let inputs: Vec<PathBuf> = subtitle_rows
+            .clone()
             .filter(|row| format != OutputFormat::Embed || row.supports_embed())
             .map(|row| row.sub.clone())
             .collect();
@@ -875,11 +991,16 @@ impl AssfontsApp {
                     .to_string(),
             );
         }
-        let videos: Vec<PathBuf> = self
-            .process_rows
-            .iter()
-            .filter_map(|row| row.video.clone())
-            .collect();
+        // mks 和 mkv 都要视频列表：按视频分组、用视频名给输出命名（mks 只是
+        // 不把视频轨封进去）；只有 embed 模式不需要 --video。
+        let videos: Vec<PathBuf> = if format != OutputFormat::Embed {
+            self.process_rows
+                .iter()
+                .filter_map(|row| row.video.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let videos = if videos.is_empty() {
             None
         } else {
@@ -987,53 +1108,143 @@ impl AssfontsApp {
         self.logs.clear();
         self.running = true;
         self.cancel_flag = Arc::new(AtomicBool::new(false));
+        self.task_progress = Some(TaskProgress {
+            title: what.clone(),
+            stage: "准备中".to_string(),
+            done: 0,
+            total: 0,
+        });
+        let label = what.clone();
 
-        let (tx, rx) = smol::channel::unbounded::<String>();
+        let (tx, rx) = smol::channel::unbounded::<TaskMessage>();
         let reporter = ChannelReporter {
             tx: tx.clone(),
             cancelled: Arc::clone(&self.cancel_flag),
         };
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(format!("开始{what}…"));
+            let _ = tx.send_blocking(TaskMessage::Line(format!("开始{what}…")));
             match task(&reporter) {
                 Ok(()) => {
-                    let _ = tx.send_blocking(format!("{what}完成。"));
+                    let _ = tx.send_blocking(TaskMessage::Line(format!("{what}完成。")));
                 }
                 Err(err) if err.to_string().contains("cancelled") => {
-                    let _ = tx.send_blocking(format!("[取消] {err}"));
-                    let _ = tx.send_blocking(format!("{what}已取消。"));
+                    let _ = tx.send_blocking(TaskMessage::Line(format!("[取消] {err}")));
+                    let _ = tx.send_blocking(TaskMessage::Line(format!("{what}已取消。")));
                 }
                 Err(err) => {
-                    let _ = tx.send_blocking(format!("[错误] {err}"));
-                    let _ = tx.send_blocking(format!("{what}失败。"));
+                    let _ = tx.send_blocking(TaskMessage::Line(format!("[错误] {err}")));
+                    let _ = tx.send_blocking(TaskMessage::Line(format!("{what}失败。")));
                 }
             }
         });
 
         cx.spawn(async move |cx| {
             while let Ok(message) = rx.recv().await {
-                let suffix_done = message.ends_with("完成。");
-                let suffix_failed = message.ends_with("失败。");
-                let suffix_cancelled = message.ends_with("已取消。");
-                let _ = weak.update(cx, |this, cx| {
-                    this.push_log(message);
-                    if suffix_done || suffix_failed || suffix_cancelled {
-                        this.running = false;
+                match message {
+                    TaskMessage::Line(message) => {
+                        let suffix_done = message.ends_with("完成。");
+                        let suffix_failed = message.ends_with("失败。");
+                        let suffix_cancelled = message.ends_with("已取消。");
+                        let _ = weak.update(cx, |this, cx| {
+                            this.push_log(message);
+                            if suffix_done || suffix_failed || suffix_cancelled {
+                                this.running = false;
+                                this.task_progress = None;
+                                let note = if suffix_done {
+                                    Notification::success("完成").title(label.clone())
+                                } else if suffix_failed {
+                                    Notification::error("失败，详见日志").title(label.clone())
+                                } else {
+                                    Notification::warning("已取消").title(label.clone())
+                                };
+                                this.push_toast(note);
+                            }
+                            cx.notify();
+                        });
+                        if suffix_done || suffix_failed || suffix_cancelled {
+                            break;
+                        }
                     }
-                    cx.notify();
-                });
-                if suffix_done || suffix_failed || suffix_cancelled {
-                    break;
+                    TaskMessage::Progress { stage, done, total } => {
+                        let _ = weak.update(cx, |this, cx| {
+                            if let Some(progress) = this.task_progress.as_mut() {
+                                // `处理字幕` 走 par_iter，完成数可能乱序到达，取已见最大值。
+                                let done = if progress.stage == stage {
+                                    progress.done.max(done)
+                                } else {
+                                    done
+                                };
+                                progress.stage = stage;
+                                progress.done = done;
+                                progress.total = total;
+                            }
+                            cx.notify();
+                        });
+                    }
+                    // 只有重命名任务会发送，这里不会收到。
+                    TaskMessage::RenameFinished { .. } => {}
                 }
             }
             let _ = weak.update(cx, |this, cx| {
                 this.running = false;
+                this.task_progress = None;
                 cx.notify();
             });
         })
         .detach();
 
         None
+    }
+
+    /// 记下一条完成提示，下一次 render 时交给通知层（那里才有 `Window`）。
+    fn push_toast(&mut self, note: Notification) {
+        self.pending_toast = Some(note);
+    }
+
+    /// 三页共用的进度卡：标题 + 阶段/计数 + 进度条（总数未知时走不确定动画）。
+    fn task_progress_card(&self, cx: &Context<Self>) -> Option<Div> {
+        let progress = self.task_progress.as_ref()?;
+        let stage_text = match progress.counters() {
+            Some(counters) => format!("{} {counters}", progress.stage),
+            None => progress.stage.clone(),
+        };
+        let bar = Progress::new("task-progress")
+            .w_full()
+            .loading(progress.total == 0)
+            .when_some(progress.percent(), |bar, percent| bar.value(percent));
+        Some(
+            div()
+                .w_full()
+                .flex_none()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(card_border(cx))
+                .bg(card_background(cx))
+                .p_3()
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(progress.title.clone()),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(muted_foreground(cx))
+                                        .child(stage_text),
+                                ),
+                        )
+                        .child(bar),
+                ),
+        )
     }
 
     /// 日志页的一行：缺少字体/读取失败整行标红；字体覆盖行只把缺字列表标红。
@@ -1103,7 +1314,9 @@ impl AssfontsApp {
 
     fn rename_options(&self) -> RenameOptions {
         RenameOptions {
-            move_to_video_dir: !self.rename_keep_in_place,
+            // 复制模式产物就是给封装用的「视频目录下的新字幕」，所以总是放到
+            // 视频旁边；「字幕原地」开关只影响直接重命名。
+            move_to_video_dir: !self.rename_keep_in_place || self.rename_copy_mode,
             fansub_suffix: self.fansub_suffix,
             language_suffix: self.language_suffix,
         }
@@ -1268,6 +1481,9 @@ impl AssfontsApp {
 
     /// 预测这一行在当前输出格式下生成的产物文件名（与 `commands.rs` 的命名规则一致）。
     fn product_name(&self, row: &ProcessRow) -> (String, bool) {
+        if row.media_only {
+            return ("—".to_string(), false);
+        }
         let sub_stem = row
             .sub
             .file_stem()
@@ -1357,10 +1573,27 @@ impl AssfontsApp {
         let rows = build_rename_rows(&scan.videos, &scan.subtitles, &naming);
         let mut flat = Vec::new();
         for row in rows {
+            if row.entries.is_empty() {
+                if let Some(video) = row.video.clone() {
+                    // 只拖了视频时也显示一行，等字幕拖进来再补成正常行。
+                    flat.push(ProcessRow {
+                        video: Some(video.clone()),
+                        sub: video,
+                        media_only: true,
+                        key: String::new(),
+                        fansub: None,
+                        fansub_name: None,
+                        language: None,
+                        language_name: None,
+                    });
+                }
+                continue;
+            }
             for entry in row.entries {
                 flat.push(ProcessRow {
                     video: row.video.clone(),
                     sub: entry.sub,
+                    media_only: false,
                     key: entry.key,
                     fansub: entry.fansub,
                     fansub_name: entry.fansub_name,
@@ -1490,51 +1723,299 @@ impl AssfontsApp {
         self.font_col_drag = None;
     }
 
-    /// 执行表格中所有“就绪”的行（按当前设置重命名或复制），随后重扫。
-    fn apply_renames(&mut self, cx: &mut Context<Self>) {
-        let rows = self.rename_rows.clone();
-        let summary = RenameSummary::of(&rows);
-        if !summary.has_ready() {
+    /// 「应用重命名」：先复查（源文件是否还是扫描时的、目标是否被占用），
+    /// 有变化就弹确认框点名跳过，再在后台线程逐行执行并推进度。
+    fn apply_renames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        let review = self.review_renames();
+        if review.queued.is_empty() {
             self.push_log("[重命名] 没有可执行的行".to_string());
+            if !review.stale.is_empty() || !review.conflicts.is_empty() {
+                self.push_log(format!(
+                    "[重命名] 跳过 {} 个目标冲突、{} 个源文件已变化/消失的行",
+                    review.conflicts.len(),
+                    review.stale.len()
+                ));
+            }
+            self.push_toast(Notification::warning("没有可执行的行").title("重命名"));
             cx.notify();
             return;
         }
-        let copy_mode = self.rename_copy_mode;
-        let verb = if copy_mode { "复制" } else { "重命名" };
-        let mut done = 0usize;
-        let mut failed = 0usize;
-        for row in &rows {
+        if review.conflicts.is_empty() && review.stale.is_empty() {
+            self.start_apply_renames(review.queued, cx);
+            return;
+        }
+
+        // 有冲突/源文件变化：点名列出，确认后只执行仍然有效的行。
+        let mut lines: Vec<String> = Vec::new();
+        if !review.conflicts.is_empty() {
+            lines.push(format!(
+                "{} 个目标文件已存在，会跳过：",
+                review.conflicts.len()
+            ));
+            lines.extend(
+                review
+                    .conflicts
+                    .iter()
+                    .take(5)
+                    .map(|path| format!("  · {}", display_name(path))),
+            );
+        }
+        if !review.stale.is_empty() {
+            lines.push(format!(
+                "{} 个源文件已变化或消失，会跳过：",
+                review.stale.len()
+            ));
+            lines.extend(
+                review
+                    .stale
+                    .iter()
+                    .take(5)
+                    .map(|path| format!("  · {}", display_name(path))),
+            );
+        }
+        let body = lines.join("\n");
+        let queued = review.queued;
+        let count = queued.len();
+        let entity = cx.entity();
+        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+            let entity = entity.clone();
+            let queued = queued.clone();
+            dialog
+                .title(format!("继续执行重命名（{count} 个）？"))
+                .description(div().text_size(px(12.)).child(body.clone()))
+                .show_cancel(true)
+                .on_ok(move |_, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.start_apply_renames(queued.clone(), cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    /// 点击「应用重命名」前的复查：源文件快照、目标占用、批内重名。
+    fn review_renames(&self) -> RenameReview {
+        let mut review = RenameReview::default();
+        for row in &self.rename_rows {
             for entry in &row.entries {
                 if entry.status != RenameStatus::Ready {
                     continue;
                 }
+                let unchanged = match entry.source {
+                    Some(stamp) => stamp.still_matches(&entry.sub),
+                    None => entry.sub.exists(),
+                };
+                if !unchanged {
+                    review.stale.push(entry.sub.clone());
+                    continue;
+                }
+                if entry.target.exists() || !review.claimed.insert(entry.target.clone()) {
+                    review.conflicts.push(entry.target.clone());
+                    continue;
+                }
+                review
+                    .queued
+                    .push((entry.sub.clone(), entry.target.clone()));
+            }
+        }
+        review
+    }
+
+    /// 后台线程逐行重命名/复制，进度写进 `task_progress`，完成后弹提示。
+    fn start_apply_renames(&mut self, queued: Vec<(PathBuf, PathBuf)>, cx: &mut Context<Self>) {
+        if queued.is_empty() {
+            return;
+        }
+        let total = queued.len();
+        let stage = if self.rename_copy_mode {
+            "复制"
+        } else {
+            "重命名"
+        };
+        self.logs.clear();
+        self.running = true;
+        self.task_progress = Some(TaskProgress {
+            title: format!("应用重命名（{total}）"),
+            stage: stage.to_string(),
+            done: 0,
+            total,
+        });
+        let copy_mode = self.rename_copy_mode;
+        let (tx, rx) = smol::channel::unbounded::<TaskMessage>();
+        std::thread::spawn(move || {
+            let verb = if copy_mode { "复制" } else { "重命名" };
+            let stage = if copy_mode { "复制" } else { "重命名" };
+            let mut done = 0usize;
+            let mut failed = 0usize;
+            let mut undo: Vec<CopyRecord> = Vec::new();
+            for (index, (sub, target)) in queued.iter().enumerate() {
                 let result = if copy_mode {
-                    std::fs::copy(&entry.sub, &entry.target).map(|_| ())
+                    std::fs::copy(sub, target).map(|_| ())
                 } else {
-                    std::fs::rename(&entry.sub, &entry.target)
+                    std::fs::rename(sub, target)
                 };
                 match result {
                     Ok(()) => {
                         done += 1;
-                        self.push_log(format!(
+                        if copy_mode && let Some(record) = CopyRecord::of(target.clone()) {
+                            undo.push(record);
+                        }
+                        let _ = tx.send_blocking(TaskMessage::Line(format!(
                             "[重命名] {verb}: {} → {}",
-                            display_name(&entry.sub),
-                            display_name(&entry.target)
-                        ));
+                            display_name(sub),
+                            display_name(target)
+                        )));
                     }
                     Err(err) => {
                         failed += 1;
-                        self.push_log(format!(
+                        let _ = tx.send_blocking(TaskMessage::Line(format!(
                             "[重命名] {verb}失败 {}: {err}",
-                            display_name(&entry.sub)
-                        ));
+                            display_name(sub)
+                        )));
+                    }
+                }
+                let _ = tx.send_blocking(TaskMessage::Progress {
+                    stage: stage.to_string(),
+                    done: index + 1,
+                    total,
+                });
+            }
+            let _ = tx.send_blocking(TaskMessage::RenameFinished { done, failed, undo });
+        });
+
+        cx.spawn(async move |weak, cx| {
+            while let Ok(message) = rx.recv().await {
+                match message {
+                    TaskMessage::Line(line) => {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.push_log(line);
+                            cx.notify();
+                        });
+                    }
+                    TaskMessage::Progress { stage, done, total } => {
+                        let _ = weak.update(cx, |this, cx| {
+                            if let Some(progress) = this.task_progress.as_mut() {
+                                // `处理字幕` 走 par_iter，完成数可能乱序到达，取已见最大值。
+                                let done = if progress.stage == stage {
+                                    progress.done.max(done)
+                                } else {
+                                    done
+                                };
+                                progress.stage = stage;
+                                progress.done = done;
+                                progress.total = total;
+                            }
+                            cx.notify();
+                        });
+                    }
+                    TaskMessage::RenameFinished { done, failed, undo } => {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.finish_apply_renames(done, failed, undo, cx);
+                        });
+                        break;
                     }
                 }
             }
-        }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_apply_renames(
+        &mut self,
+        done: usize,
+        failed: usize,
+        undo: Vec<CopyRecord>,
+        cx: &mut Context<Self>,
+    ) {
+        self.running = false;
+        self.task_progress = None;
         self.push_log(format!("[重命名] 完成：成功 {done} 个，失败 {failed} 个"));
+        if self.rename_copy_mode && !undo.is_empty() {
+            self.rename_undo = undo;
+            let count = self.rename_undo.len();
+            self.push_log(format!(
+                "[重命名] 已记录 {count} 个复制出的文件，可用「撤销上次复制」删除"
+            ));
+        } else {
+            self.rename_undo.clear();
+        }
+        let note = if failed == 0 {
+            Notification::success(format!("成功 {done} 个")).title("重命名")
+        } else {
+            Notification::warning(format!("成功 {done} 个，失败 {failed} 个，详见日志"))
+                .title("重命名")
+        };
+        self.push_toast(note);
         self.refresh_rename(cx);
         self.persist(cx);
+    }
+
+    /// 「撤销上次复制」：只删上次复制写出、且大小/mtime 没变过的文件。
+    fn request_undo_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running || self.rename_undo.is_empty() {
+            return;
+        }
+        let count = self.rename_undo.len();
+        let lines: Vec<String> = self
+            .rename_undo
+            .iter()
+            .take(5)
+            .map(|record| format!("  · {}", display_name(&record.path)))
+            .collect();
+        let body = lines.join("\n");
+        let entity = cx.entity();
+        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+            let entity = entity.clone();
+            dialog
+                .title(format!("撤销上次复制（{count} 个文件）？"))
+                .description(div().text_size(px(12.)).child(format!(
+                    "将删除这些复制出来的字幕，原字幕不受影响：\n{body}"
+                )))
+                .show_cancel(true)
+                .on_ok(move |_, _window, cx| {
+                    entity.update(cx, |this, cx| this.undo_last_copy(cx));
+                    true
+                })
+        });
+    }
+
+    /// 删除上次复制写出的文件；大小/mtime 变过的保留不动。
+    fn undo_last_copy(&mut self, cx: &mut Context<Self>) {
+        let records = std::mem::take(&mut self.rename_undo);
+        let mut removed = 0usize;
+        let mut kept = 0usize;
+        let mut failed = 0usize;
+        for record in records {
+            if !record.still_ours() {
+                kept += 1;
+                continue;
+            }
+            match std::fs::remove_file(&record.path) {
+                Ok(()) => removed += 1,
+                Err(err) => {
+                    failed += 1;
+                    self.push_log(format!(
+                        "[重命名] 撤销失败 {}: {err}",
+                        display_name(&record.path)
+                    ));
+                }
+            }
+        }
+        if kept > 0 {
+            self.push_log(format!("[重命名] {kept} 个文件已被修改或删除，保留不删"));
+        }
+        self.push_log(format!(
+            "[重命名] 撤销完成：删除 {removed} 个，保留 {kept} 个，失败 {failed} 个"
+        ));
+        self.push_toast(
+            Notification::success(format!("已删除 {removed} 个复制出的字幕")).title("撤销复制"),
+        );
+        self.refresh_rename(cx);
+        cx.notify();
     }
 
     // -- rendering helpers -------------------------------------------------
@@ -1946,33 +2427,60 @@ impl AssfontsApp {
                 let menu_groups = self.fansub_groups.clone();
                 let menu_categories = self.suffix_categories.clone();
                 let default_key = self.default_track_key.clone();
+                // mks/mkv 每个输出文件会有一条默认字幕轨：没手动指定归类键时取
+                // 组内第一条，指定了就按归类键命中；在字幕名前加星标。
+                let default_star = (!embed
+                    && !row.media_only
+                    && match &self.default_track_key {
+                        Some(key) => !key.is_empty() && row.key.eq_ignore_ascii_case(key),
+                        None => offset == 0,
+                    })
+                .then(|| {
+                    Icon::new(IconName::Star)
+                        .xsmall()
+                        .flex_none()
+                        .text_color(cx.theme().warning)
+                });
                 let sub_cell = h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
                     .justify_center()
                     .gap_1()
+                    .children(default_star)
                     .child(
                         div()
                             .truncate()
                             .text_size(px(12.5))
-                            .child(display_name(&row.sub)),
+                            .when(row.media_only, |this| this.text_color(muted))
+                            .child(if row.media_only {
+                                "—".to_string()
+                            } else {
+                                display_name(&row.sub)
+                            }),
                     )
-                    .children(pills)
-                    .context_menu(move |menu, window, cx| {
-                        subtitle_context_menu(
-                            menu,
-                            window,
-                            cx,
-                            menu_entity.clone(),
-                            menu_key.clone(),
-                            menu_fansub.clone(),
-                            menu_language.clone(),
-                            menu_groups.clone(),
-                            menu_categories.clone(),
-                            default_key.clone(),
-                        )
-                    });
+                    .children(pills);
+                // 占位行没有字幕，不给字幕右键菜单。
+                let sub_cell = if row.media_only {
+                    sub_cell.into_any_element()
+                } else {
+                    sub_cell
+                        .context_menu(move |menu, window, cx| {
+                            subtitle_context_menu(
+                                menu,
+                                window,
+                                cx,
+                                menu_entity.clone(),
+                                menu_key.clone(),
+                                menu_fansub.clone(),
+                                menu_language.clone(),
+                                menu_groups.clone(),
+                                menu_categories.clone(),
+                                default_key.clone(),
+                            )
+                        })
+                        .into_any_element()
+                };
                 let mut line = h_flex().w_full().items_center().child(
                     div()
                         .flex_1()
@@ -2265,6 +2773,8 @@ impl AssfontsApp {
                     .child(process_header)
                     .child(process_table),
             )
+            // 任务进度卡：运行/测试/重建索引时显示标题、阶段与进度条。
+            .when_some(self.task_progress_card(cx), |this, card| this.child(card))
             // 操作栏固定在最下方：字体目录 / 格式 / 封装器 / 运行。
             .child(Self::card(
                 cx,
@@ -2817,6 +3327,8 @@ impl AssfontsApp {
             .h_full()
             .overflow_y_scroll()
             .child(Self::page_header(cx, "字体", "字体索引与字体库维护"))
+            // 重建索引时的进度卡（和表格一起看得到进度）。
+            .when_some(self.task_progress_card(cx), |this, card| this.child(card))
             .child(table_card)
             .child(Self::card(
                 cx,
@@ -3241,6 +3753,7 @@ impl AssfontsApp {
 
         let clear_entity = entity.clone();
         let apply_entity = entity.clone();
+        let undo_entity = entity.clone();
         let drop_entity = entity.clone();
 
         // 操作按钮跟表格在同一张卡片里，表格和卡片之间不再留出多余空白。
@@ -3264,14 +3777,27 @@ impl AssfontsApp {
                             });
                         },
                     ))
+                    // 复制模式留下的「撤销上次复制」只在有记录时出现。
+                    .when(!self.rename_undo.is_empty(), |this| {
+                        this.child(
+                            Button::new("rename-undo-copy")
+                                .ghost()
+                                .label("撤销上次复制")
+                                .on_click(move |_, window, cx| {
+                                    undo_entity.update(cx, |this, cx| {
+                                        this.request_undo_copy(window, cx);
+                                    });
+                                }),
+                        )
+                    })
                     .child(
                         Button::new("rename-apply")
                             .primary()
                             .label(apply_label)
                             .disabled(!can_apply)
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 apply_entity.update(cx, |this, cx| {
-                                    this.apply_renames(cx);
+                                    this.apply_renames(window, cx);
                                 });
                             }),
                     ),
@@ -3286,6 +3812,8 @@ impl AssfontsApp {
                 "重命名",
                 "拖入视频与字幕文件夹，按文件名自动配对并批量对齐字幕名",
             ))
+            // 应用重命名/复制时的进度卡。
+            .when_some(self.task_progress_card(cx), |this, card| this.child(card))
             .child(
                 div()
                     .w_full()
@@ -3502,7 +4030,7 @@ impl AssfontsApp {
                             .child(
                                 Button::new("track-name-style")
                                     .label(track_label)
-                                    .tooltip("英文：KTXP.TC；中文：极影字幕社.繁体（语言标记：简体→zh-Hans、繁体→zh-Hant、日语→jpn、英语→eng）")
+                                    .tooltip("英文：KTXP-TC；中文：极影字幕社-繁体（语言标记：简体→zh-Hans、繁体→zh-Hant、日语→jpn、英语→eng）")
                                     .on_click(move |_, _, cx| {
                                         track_entity.update(cx, |this, cx| {
                                             this.track_name_style =
@@ -3592,14 +4120,14 @@ impl AssfontsApp {
                     .child(row(
                         "rename-move",
                         "移动字幕到视频目录",
-                        "输出字幕写入对应视频所在目录；关闭则原地重命名（多目录时推荐开启）",
+                        "输出字幕写入对应视频所在目录；关闭则原地重命名（多目录时推荐开启）。复制模式下始终写入视频目录",
                         !self.rename_keep_in_place,
                         |this, value| this.rename_keep_in_place = !value,
                     ))
                     .child(row(
                         "rename-copy",
                         "复制而非移动",
-                        "保留原字幕文件，写入一份对齐后的副本",
+                        "保留原字幕文件，在视频目录写入一份对齐后的副本",
                         self.rename_copy_mode,
                         |this, value| this.rename_copy_mode = value,
                     ))
@@ -3986,6 +4514,10 @@ fn run_build_clicked(entity: &Entity<AssfontsApp>, cx: &mut App) {
 
 impl Render for AssfontsApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 后台任务结束记下的提示，在这里补上窗口上下文推给通知层（toast）。
+        if let Some(note) = self.pending_toast.take() {
+            window.push_notification(note, cx);
+        }
         let content = match self.page {
             Page::Process => self.render_process(window, cx).into_any_element(),
             Page::Fonts => self.render_fonts(window, cx).into_any_element(),
@@ -4168,7 +4700,51 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{font_row_matches, group_font_rows, missing_chars_range, sidebar_width};
+    use super::{
+        CopyRecord, TaskProgress, font_row_matches, group_font_rows, missing_chars_range,
+        sidebar_width,
+    };
+
+    #[test]
+    fn task_progress_uses_real_counts_and_stays_indeterminate_without_a_total() {
+        let known = TaskProgress {
+            title: "处理".to_string(),
+            stage: "处理字幕".to_string(),
+            done: 3,
+            total: 4,
+        };
+        assert_eq!(known.percent(), Some(75.0));
+        assert_eq!(known.counters().as_deref(), Some("3/4"));
+
+        let unknown = TaskProgress {
+            title: "重建索引".to_string(),
+            stage: "扫描字体目录".to_string(),
+            done: 0,
+            total: 0,
+        };
+        assert_eq!(unknown.percent(), None);
+        assert_eq!(unknown.counters(), None);
+    }
+
+    #[test]
+    fn copy_record_only_claims_files_left_untouched() {
+        let dir = std::env::temp_dir().join(format!("assfonts-copy-record-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("sub.ass");
+        std::fs::write(&path, b"[Script Info]\n").expect("write");
+
+        let record = CopyRecord::of(path.clone()).expect("record");
+        assert!(record.still_ours());
+
+        // 大小变化后不再是「我们复制出来的那份」。
+        std::fs::write(&path, b"[Script Info]\nTitle: changed\n").expect("rewrite");
+        assert!(!record.still_ours());
+
+        // 文件被删掉同样不再认领。
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!record.still_ours());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn font_row_matches_path_names_aliases_and_weight() {

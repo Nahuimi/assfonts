@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use clap::ValueEnum;
@@ -234,14 +236,14 @@ pub fn language_for_comment(comment: Option<&str>, spec: &LanguageSpec) -> Optio
         .map(|(_, language)| language.to_string())
 }
 
-/// mks/mkv 轨道命名方式：英文（`KTXP.TC`）或中文（`极影字幕社.繁体`）。
+/// mks/mkv 轨道命名方式：英文（`KTXP-TC`）或中文（`极影字幕社-繁体`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum TrackNameStyle {
-    /// 字幕组缩写 + 英文语言后缀（`KTXP.TC`）
+    /// 字幕组缩写 + 英文语言后缀（`KTXP-TC`）
     #[default]
     English,
-    /// 字幕组中文名 + 中文分类名（`极影字幕社.繁体`）
+    /// 字幕组中文名 + 中文分类名（`极影字幕社-繁体`）
     Chinese,
 }
 
@@ -315,44 +317,49 @@ impl TrackMetaOptions<'_> {
         if parts.is_empty() {
             None
         } else {
-            Some(parts.join("."))
+            // 字幕组后缀与语言后缀之间用「-」连接（`KTXP-TC`）：播放器里一眼
+            // 能分出两段，也不会和文件名里的「.」分隔混在一起。
+            Some(parts.join("-"))
         }
     }
 }
 
 /// 按「字幕组 + 语言分类」计算轨道标题与语言标记；手动覆盖优先于内置表。
 ///
-/// 例：英文 `KTXP.TC`、中文 `极影字幕社.繁体`；两后缀都关时标题为 `None`。
+/// 例：英文 `KTXP-TC`、中文 `极影字幕社-繁体`；两后缀都关时标题为 `None`。
+///
+/// 右键只设置了字幕组（或只设置了语言）时，另一项回退到内置表的自动识别，
+/// 否则轨道标题会缺一段、语言标记退化成 `und`。
 pub fn subtitle_track_meta(comment: Option<&str>, options: &TrackMetaOptions<'_>) -> TrackMeta {
     let Some(comment) = comment else {
         return TrackMeta::default();
     };
     let key = naming_key(Some(comment), options.categories);
-    if let Some(over) = options.overrides.get(&key) {
-        let title = options.join(over.fansub.as_deref(), over.language.as_deref());
-        let language = over
-            .language
-            .as_deref()
-            .and_then(language_tag_for_text)
-            .map(str::to_string);
-        return TrackMeta { title, language };
-    }
-
     let category = classify_in(options.categories, comment);
     let group = detect_fansub_group(comment, options.groups);
-    let fansub = group.map(|group| match options.style {
+    let auto_fansub = group.map(|group| match options.style {
         TrackNameStyle::English => group.abbr.as_str(),
         TrackNameStyle::Chinese => group.name.as_str(),
     });
-    let language_suffix = category.map(|category| match options.style {
+    let auto_language = category.map(|category| match options.style {
         TrackNameStyle::English => category.suffix.as_str(),
         TrackNameStyle::Chinese => category.name.as_str(),
     });
+
+    let over = options.overrides.get(&key);
+    let fansub = over.and_then(|over| over.fansub.as_deref()).or(auto_fansub);
+    let language_suffix = over
+        .and_then(|over| over.language.as_deref())
+        .or(auto_language);
+    let language = over
+        .and_then(|over| over.language.as_deref())
+        .and_then(language_tag_for_text)
+        .or_else(|| category.and_then(language_tag_for_category))
+        .map(str::to_string);
+
     TrackMeta {
         title: options.join(fansub, language_suffix),
-        language: category
-            .and_then(language_tag_for_category)
-            .map(str::to_string),
+        language,
     }
 }
 
@@ -381,7 +388,7 @@ pub fn match_media_groups_by_order(
     subs: &[PathBuf],
 ) -> (Vec<(PathBuf, Vec<PathBuf>)>, Vec<PathBuf>) {
     let mut sorted_videos: Vec<PathBuf> = videos.to_vec();
-    sorted_videos.sort();
+    sort_natural(&mut sorted_videos);
 
     let mut sub_stems: Vec<(String, PathBuf)> = subs
         .iter()
@@ -394,7 +401,7 @@ pub fn match_media_groups_by_order(
             (stem, sub.clone())
         })
         .collect();
-    sub_stems.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    sub_stems.sort_by(|a, b| natural_cmp(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
 
     // Group consecutive entries sharing a base name.
     let mut groups: Vec<Vec<PathBuf>> = Vec::new();
@@ -861,6 +868,38 @@ pub enum RenameStatus {
     Unmatched,
 }
 
+/// Size and modification time of a subtitle file when the rename plan was
+/// built; the GUI compares it right before applying to detect files that
+/// changed (or disappeared) since the scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceStamp {
+    /// File size in bytes.
+    pub size: u64,
+    /// Modification time as seconds since the Unix epoch.
+    pub mtime: i64,
+}
+
+impl SourceStamp {
+    /// Reads the current stamp of `path`; fails when the file is missing.
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        let mtime = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        Ok(Self {
+            size: metadata.len(),
+            mtime,
+        })
+    }
+
+    /// Whether `path` still has exactly this size and modification time.
+    pub fn still_matches(&self, path: &Path) -> bool {
+        Self::of(path).is_ok_and(|now| now == *self)
+    }
+}
+
 /// One subtitle row of the rename table.
 #[derive(Debug, Clone)]
 pub struct RenameEntry {
@@ -882,6 +921,9 @@ pub struct RenameEntry {
     /// 语言后缀来源（分类名 / 覆盖键，`("简体", "SC")`）。
     pub rule_hit: Option<(String, String)>,
     pub status: RenameStatus,
+    /// Size/mtime snapshot of `sub` taken while building the plan (`None` when
+    /// the file could not be read at that point).
+    pub source: Option<SourceStamp>,
 }
 
 /// A video and its subtitles; `video == None` for subtitle groups left over.
@@ -1048,6 +1090,7 @@ pub fn build_rename_rows_with(
                     target: sub.clone(),
                     rule_hit: None,
                     status: RenameStatus::Unmatched,
+                    source: SourceStamp::of(sub).ok(),
                 });
                 continue;
             }
@@ -1064,6 +1107,7 @@ pub fn build_rename_rows_with(
                     target: sub.clone(),
                     rule_hit: None,
                     status: RenameStatus::Unmatched,
+                    source: SourceStamp::of(sub).ok(),
                 });
                 continue;
             };
@@ -1169,6 +1213,7 @@ pub fn build_rename_rows_with(
                 target,
                 rule_hit,
                 status,
+                source: SourceStamp::of(sub).ok(),
             });
         }
 
@@ -1191,9 +1236,35 @@ mod tests {
     };
 
     use super::{
-        LanguageSpec, language_for_comment, match_media_groups, matches_media_prefix,
+        LanguageSpec, SourceStamp, language_for_comment, match_media_groups, matches_media_prefix,
         parse_language_spec, resolve_output_path, standalone_comment, subtitle_comment,
     };
+
+    #[test]
+    fn source_stamp_detects_changed_and_missing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "assfonts-source-stamp-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Show - 01.chs.ass");
+        fs::write(&path, b"[Script Info]").unwrap();
+        let stamp = SourceStamp::of(&path).unwrap();
+        assert!(stamp.still_matches(&path));
+
+        // A different size is enough to notice that the file changed.
+        fs::write(&path, b"[Script Info]\nTitle: changed").unwrap();
+        assert!(!stamp.still_matches(&path));
+
+        fs::remove_file(&path).unwrap();
+        assert!(!stamp.still_matches(&path));
+        assert!(SourceStamp::of(&path).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn subtitle_comment_extracts_and_strips_markers() {
@@ -1449,6 +1520,28 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, PathBuf::from("v1.mkv"));
         assert_eq!(unmatched, vec![PathBuf::from("s2.ass")]);
+    }
+
+    #[test]
+    fn order_matching_sorts_naturally() {
+        use super::match_media_groups_by_order;
+
+        // 自然排序：2 要排在 10 前面（字典序会把 10 排前面，配对就错了）。
+        let videos = vec![
+            PathBuf::from("Show - 10.mkv"),
+            PathBuf::from("Show - 2.mkv"),
+        ];
+        let subs = vec![
+            PathBuf::from("第10话.chs.ass"),
+            PathBuf::from("第2话.chs.ass"),
+        ];
+        let (groups, unmatched) = match_media_groups_by_order(&videos, &subs);
+        assert!(unmatched.is_empty());
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, PathBuf::from("Show - 2.mkv"));
+        assert_eq!(groups[0].1, vec![PathBuf::from("第2话.chs.ass")]);
+        assert_eq!(groups[1].0, PathBuf::from("Show - 10.mkv"));
+        assert_eq!(groups[1].1, vec![PathBuf::from("第10话.chs.ass")]);
     }
 
     #[test]
@@ -1986,14 +2079,14 @@ mod track_meta_tests {
     #[test]
     fn english_track_name_uses_abbr_and_suffix() {
         let got = meta("Show 01.KTXP.TC", TrackNameStyle::English, true, true);
-        assert_eq!(got.title.as_deref(), Some("KTXP.TC"));
+        assert_eq!(got.title.as_deref(), Some("KTXP-TC"));
         assert_eq!(got.language.as_deref(), Some("zh-Hant"));
     }
 
     #[test]
     fn chinese_track_name_uses_group_name_and_category() {
         let got = meta("Show 01.KTXP.TC", TrackNameStyle::Chinese, true, true);
-        assert_eq!(got.title.as_deref(), Some("极影字幕社.繁体"));
+        assert_eq!(got.title.as_deref(), Some("极影字幕社-繁体"));
         assert_eq!(got.language.as_deref(), Some("zh-Hant"));
     }
 
@@ -2035,7 +2128,86 @@ mod track_meta_tests {
             language_enabled: true,
         };
         let got = subtitle_track_meta(Some("Show 01.sc"), &options);
-        assert_eq!(got.title.as_deref(), Some("Custom.SCJP"));
+        assert_eq!(got.title.as_deref(), Some("Custom-SCJP"));
+        assert_eq!(got.language.as_deref(), Some("zh-Hans"));
+    }
+
+    /// 右键只设置字幕组时，语言后缀要回退到内置分类，标题不能只留一段、语言
+    /// 标记也不能退化成 `und`。
+    #[test]
+    fn partial_override_keeps_auto_language_suffix() {
+        let categories = default_categories().to_vec();
+        let groups = default_fansub_groups();
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "简体".to_string(),
+            SuffixOverride {
+                fansub: Some("Custom".to_string()),
+                language: None,
+            },
+        );
+        let options = TrackMetaOptions {
+            categories: &categories,
+            groups: &groups,
+            overrides: &overrides,
+            style: TrackNameStyle::English,
+            fansub_enabled: true,
+            language_enabled: true,
+        };
+        let got = subtitle_track_meta(Some("Show 01.sc"), &options);
+        assert_eq!(got.title.as_deref(), Some("Custom-SC"));
+        assert_eq!(got.language.as_deref(), Some("zh-Hans"));
+    }
+
+    /// 右键只设置语言时，字幕组要回退到内置表。
+    #[test]
+    fn partial_override_keeps_auto_fansub_suffix() {
+        let categories = default_categories().to_vec();
+        let groups = default_fansub_groups();
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "简体".to_string(),
+            SuffixOverride {
+                fansub: None,
+                language: Some("TC".to_string()),
+            },
+        );
+        let options = TrackMetaOptions {
+            categories: &categories,
+            groups: &groups,
+            overrides: &overrides,
+            style: TrackNameStyle::English,
+            fansub_enabled: true,
+            language_enabled: true,
+        };
+        let got = subtitle_track_meta(Some("Show 01.KTXP.sc"), &options);
+        assert_eq!(got.title.as_deref(), Some("KTXP-TC"));
+        assert_eq!(got.language.as_deref(), Some("zh-Hant"));
+    }
+
+    /// 自定义语言文本认不出语言标记时，回退到分类对应的标记，避免 `und`。
+    #[test]
+    fn unrecognized_override_text_falls_back_to_category_language() {
+        let categories = default_categories().to_vec();
+        let groups = default_fansub_groups();
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "简体".to_string(),
+            SuffixOverride {
+                fansub: None,
+                language: Some("XL".to_string()),
+            },
+        );
+        let options = TrackMetaOptions {
+            categories: &categories,
+            groups: &groups,
+            overrides: &overrides,
+            style: TrackNameStyle::English,
+            fansub_enabled: true,
+            language_enabled: true,
+        };
+        let got = subtitle_track_meta(Some("Show 01.KTXP.sc"), &options);
+        assert_eq!(got.title.as_deref(), Some("KTXP-XL"));
         assert_eq!(got.language.as_deref(), Some("zh-Hans"));
     }
 }

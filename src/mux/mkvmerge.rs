@@ -1,6 +1,6 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path};
 
-use super::{MuxResult, job::MuxJob};
+use super::{MuxResult, command, job::MuxJob};
 use crate::error::{AssfontsError, Result};
 
 pub struct MkvmergeMuxer {
@@ -82,7 +82,7 @@ impl super::Muxer for MkvmergeMuxer {
         let option_args = serde_json::to_vec_pretty(&build_option_args(job))?;
         fs::write(&option_path, option_args)?;
 
-        let run = Command::new(&self.program)
+        let run = command(&self.program)
             .arg(format!("@{}", option_path.display()))
             .arg("-o")
             .arg(&job.output)

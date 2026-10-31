@@ -63,12 +63,12 @@ assfonts -i /path/to/ass/files -o output_dir -f /path/to/fonts -d /path/to/db
 - `--allow-missing-fonts`：允许缺失字体
 - `--report`：处理后生成 `run-report.json` 报告
 - `--force`：覆盖已存在的输出文件
-- `--format embed|mks|mkv`：输出格式（默认 `embed`）。`mks` 将每条字幕与其子集化字体封装为独立 Matroska 文件；`mkv` 将视频 + 字幕 + 字体封装为 MKV
+- `--format embed|mks|mkv`：输出格式（默认 `embed`）。`mks` 把字幕与其子集化字体封装成独立 Matroska 文件，按视频分组、用视频文件名命名（一个视频一个文件，不含视频轨；没配到视频的字幕各自封装）；`mkv` 将视频 + 字幕 + 字体封装为 MKV
 - `--video <path>...`：`--format mkv` 的媒体文件或目录（按文件名与字幕配对）
 - `--muxer mkvmerge|ffmpeg`：mks/mkv 使用的封装器（默认 `mkvmerge`）
 - `--language <spec>`：字幕语言，如 `chi`（全部轨道）或 `.sc=chi;.tc=chi` 注释映射（内置 `.sc/.tc/.chs/.cht/...` 映射优先生效）
 - `--default-track <comment>`：指定为默认轨的字幕注释（文件名中媒体名之后的部分）
-- `--track-name-style english|chinese`：mks/mkv 轨道标题风格（默认 `english`，如 `KTXP.TC`；`chinese` 如 `极影字幕社.繁体`）
+- `--track-name-style english|chinese`：mks/mkv 轨道标题风格（默认 `english`，如 `KTXP-TC`；`chinese` 如 `极影字幕社-繁体`）
 - `--track-fansub-suffix <BOOL>`：轨道名是否包含字幕组后缀（默认 true）
 - `--track-language-suffix <BOOL>`：轨道名是否包含语言后缀（默认 true）
 - `--title <title>`：覆盖容器标题（默认为媒体文件名）
